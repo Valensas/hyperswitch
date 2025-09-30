@@ -1,86 +1,100 @@
 # NATS Bridge Connector - Implementation TODO
 
+## Protocol Summary
+
+**Architecture**: merchant_id in BOTH headers AND body
+
+```
+Subject:  hyperswitch.payments.authorize  (NO merchant_id)
+Headers:  X-Merchant-Id: merchant_123      (for NATS observability)
+Body:     { "merchant_id": "merchant_123", ... }  (authoritative)
+```
+
+**Why**: Provides NATS-level observability without subject explosion, while keeping body authoritative.
+
+---
+
 ## Trait to NATS/JetStream Mapping
 
 ### Core Payment Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **PaymentAuthorize** | `hyperswitch.payments.{merchant_id}.authorize` | ✅ Yes - Persistent | Authorizes payment, holds funds. Critical operation requiring durability and replay capability |
-| **PaymentCapture** | `hyperswitch.payments.{merchant_id}.capture` | ✅ Yes - Persistent | Captures authorized funds. Needs audit trail and idempotency |
-| **PaymentVoid** | `hyperswitch.payments.{merchant_id}.void` | ✅ Yes - Persistent | Cancels authorized payment. Must be durable for reconciliation |
-| **PaymentSync** | `hyperswitch.payments.{merchant_id}.sync` | ⚡ No - Request/Reply | Status check operation. Real-time response needed, no persistence required |
-| **PaymentSession** | `hyperswitch.payments.{merchant_id}.session` | ⚡ No - Request/Reply | Creates payment session tokens. Ephemeral, real-time operation |
-| **PaymentCompleteAuthorize** | `hyperswitch.payments.{merchant_id}.complete_authorize` | ✅ Yes - Persistent | Completes 3DS/2FA authorization. Critical for payment completion |
-| **PaymentApprove** | `hyperswitch.payments.{merchant_id}.approve` | ✅ Yes - Persistent | Manual payment approval. Needs audit trail |
-| **PaymentReject** | `hyperswitch.payments.{merchant_id}.reject` | ✅ Yes - Persistent | Manual payment rejection. Needs audit trail |
-| **PaymentPostSessionTokens** | `hyperswitch.payments.{merchant_id}.post_session_tokens` | ⚡ No - Request/Reply | Updates session tokens. Ephemeral operation |
-| **PaymentIncrementalAuthorization** | `hyperswitch.payments.{merchant_id}.incremental_auth` | ✅ Yes - Persistent | Increases authorization amount. Financial operation requiring durability |
-| **PaymentUpdateMetadata** | `hyperswitch.payments.{merchant_id}.update_metadata` | ✅ Yes - Persistent | Updates payment metadata. Needs audit trail |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **PaymentAuthorize** | `hyperswitch.payments.authorize` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Authorizes payment, holds funds. Critical operation requiring durability and replay capability |
+| **PaymentCapture** | `hyperswitch.payments.capture` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Captures authorized funds. Needs audit trail and idempotency |
+| **PaymentVoid** | `hyperswitch.payments.void` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Cancels authorized payment. Must be durable for reconciliation |
+| **PaymentSync** | `hyperswitch.payments.sync` | ⚡ Request/Reply | X-Merchant-Id, X-Payment-Id | Status check operation. Real-time response needed, no persistence required |
+| **PaymentSession** | `hyperswitch.payments.session` | ⚡ Request/Reply | X-Merchant-Id | Creates payment session tokens. Ephemeral, real-time operation |
+| **PaymentCompleteAuthorize** | `hyperswitch.payments.complete_authorize` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Completes 3DS/2FA authorization. Critical for payment completion |
+| **PaymentApprove** | `hyperswitch.payments.approve` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Manual payment approval. Needs audit trail |
+| **PaymentReject** | `hyperswitch.payments.reject` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Manual payment rejection. Needs audit trail |
+| **PaymentPostSessionTokens** | `hyperswitch.payments.post_session_tokens` | ⚡ Request/Reply | X-Merchant-Id | Updates session tokens. Ephemeral operation |
+| **PaymentIncrementalAuthorization** | `hyperswitch.payments.incremental_auth` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Increases authorization amount. Financial operation requiring durability |
+| **PaymentUpdateMetadata** | `hyperswitch.payments.update_metadata` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Updates payment metadata. Needs audit trail |
 
 ### Refund Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **RefundExecute** | `hyperswitch.refunds.{merchant_id}.execute` | ✅ Yes - Persistent | Initiates refund. Critical financial operation |
-| **RefundSync** | `hyperswitch.refunds.{merchant_id}.sync` | ⚡ No - Request/Reply | Checks refund status. Real-time query |
-| **RefundUpdate** | `hyperswitch.refunds.{merchant_id}.update` | ✅ Yes - Persistent | Updates refund details. Needs audit trail |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **RefundExecute** | `hyperswitch.refunds.execute` | ✅ Persistent | X-Merchant-Id, X-Refund-Id | Initiates refund. Critical financial operation |
+| **RefundSync** | `hyperswitch.refunds.sync` | ⚡ Request/Reply | X-Merchant-Id, X-Refund-Id | Checks refund status. Real-time query |
+| **RefundUpdate** | `hyperswitch.refunds.update` | ✅ Persistent | X-Merchant-Id, X-Refund-Id | Updates refund details. Needs audit trail |
 
 ### Mandate/Recurring Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **MandateSetup** | `hyperswitch.mandates.{merchant_id}.setup` | ✅ Yes - Persistent | Sets up recurring payment mandate. Long-term storage needed |
-| **MandateRevoke** | `hyperswitch.mandates.{merchant_id}.revoke` | ✅ Yes - Persistent | Cancels recurring mandate. Critical operation |
-| **MandateUpdate** | `hyperswitch.mandates.{merchant_id}.update` | ✅ Yes - Persistent | Updates mandate details. Needs versioning |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **MandateSetup** | `hyperswitch.mandates.setup` | ✅ Persistent | X-Merchant-Id, X-Mandate-Id | Sets up recurring payment mandate. Long-term storage needed |
+| **MandateRevoke** | `hyperswitch.mandates.revoke` | ✅ Persistent | X-Merchant-Id, X-Mandate-Id | Cancels recurring mandate. Critical operation |
+| **MandateUpdate** | `hyperswitch.mandates.update` | ✅ Persistent | X-Merchant-Id, X-Mandate-Id | Updates mandate details. Needs versioning |
 
 ### Token Management Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **PaymentToken** | `hyperswitch.tokens.{merchant_id}.create` | ✅ Yes - Persistent | Creates payment token. Security-critical, needs audit |
-| **TokenValidate** | `hyperswitch.tokens.{merchant_id}.validate` | ⚡ No - Request/Reply | Validates token. Real-time check |
-| **TokenDelete** | `hyperswitch.tokens.{merchant_id}.delete` | ✅ Yes - Persistent | Deletes payment token. Compliance requirement |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **PaymentToken** | `hyperswitch.tokens.create` | ✅ Persistent | X-Merchant-Id, X-Token-Id | Creates payment token. Security-critical, needs audit |
+| **TokenValidate** | `hyperswitch.tokens.validate` | ⚡ Request/Reply | X-Merchant-Id, X-Token-Id | Validates token. Real-time check |
+| **TokenDelete** | `hyperswitch.tokens.delete` | ✅ Persistent | X-Merchant-Id, X-Token-Id | Deletes payment token. Compliance requirement |
 
 ### Authentication Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **ExternalAuthentication** | `hyperswitch.auth.{merchant_id}.external` | ⚡ No - Request/Reply | 3DS/2FA authentication. Real-time operation |
-| **ConnectorAccessToken** | `hyperswitch.auth.{merchant_id}.access_token` | ⚡ No - Request/Reply | Gets connector access token. Short-lived tokens |
-| **ConnectorAuthenticationToken** | `hyperswitch.auth.{merchant_id}.auth_token` | ⚡ No - Request/Reply | Gets authentication token. Ephemeral |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **ExternalAuthentication** | `hyperswitch.auth.external` | ⚡ Request/Reply | X-Merchant-Id, X-Payment-Id | 3DS/2FA authentication. Real-time operation |
+| **ConnectorAccessToken** | `hyperswitch.auth.access_token` | ⚡ Request/Reply | X-Merchant-Id, X-Connector | Gets connector access token. Short-lived tokens |
+| **ConnectorAuthenticationToken** | `hyperswitch.auth.auth_token` | ⚡ Request/Reply | X-Merchant-Id, X-Connector | Gets authentication token. Ephemeral |
 
 ### Dispute Management Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **AcceptDispute** | `hyperswitch.disputes.{merchant_id}.accept` | ✅ Yes - Persistent | Accepts dispute. Legal/compliance requirement |
-| **DefendDispute** | `hyperswitch.disputes.{merchant_id}.defend` | ✅ Yes - Persistent | Submits dispute evidence. Needs document trail |
-| **SubmitEvidence** | `hyperswitch.disputes.{merchant_id}.evidence` | ✅ Yes - Persistent | Uploads dispute evidence. Document storage |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **AcceptDispute** | `hyperswitch.disputes.accept` | ✅ Persistent | X-Merchant-Id, X-Dispute-Id | Accepts dispute. Legal/compliance requirement |
+| **DefendDispute** | `hyperswitch.disputes.defend` | ✅ Persistent | X-Merchant-Id, X-Dispute-Id | Submits dispute evidence. Needs document trail |
+| **SubmitEvidence** | `hyperswitch.disputes.submit_evidence` | ✅ Persistent | X-Merchant-Id, X-Dispute-Id | Uploads dispute evidence. Document storage |
 
 ### Webhook Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **IncomingWebhook** | `hyperswitch.webhooks.{merchant_id}.{connector}.incoming` | ✅ Yes - Persistent | Processes incoming webhooks. Must not lose events |
-| **VerifyWebhookSource** | `hyperswitch.webhooks.{merchant_id}.verify` | ⚡ No - Request/Reply | Verifies webhook signature. Real-time validation |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **IncomingWebhook** | `hyperswitch.webhooks.incoming` | ✅ Persistent | X-Merchant-Id, X-Connector | Processes incoming webhooks. Must not lose events |
+| **VerifyWebhookSource** | `hyperswitch.webhooks.verify` | ⚡ Request/Reply | X-Merchant-Id, X-Connector | Verifies webhook signature. Real-time validation |
 
 ### Payout Traits → NATS Operations (if enabled)
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **PayoutCreate** | `hyperswitch.payouts.{merchant_id}.create` | ✅ Yes - Persistent | Creates payout. Financial operation |
-| **PayoutFulfill** | `hyperswitch.payouts.{merchant_id}.fulfill` | ✅ Yes - Persistent | Executes payout. Critical financial operation |
-| **PayoutCancel** | `hyperswitch.payouts.{merchant_id}.cancel` | ✅ Yes - Persistent | Cancels payout. Needs audit trail |
-| **PayoutSync** | `hyperswitch.payouts.{merchant_id}.sync` | ⚡ No - Request/Reply | Checks payout status. Real-time query |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **PayoutCreate** | `hyperswitch.payouts.create` | ✅ Persistent | X-Merchant-Id, X-Payout-Id | Creates payout. Financial operation |
+| **PayoutFulfill** | `hyperswitch.payouts.fulfill` | ✅ Persistent | X-Merchant-Id, X-Payout-Id | Executes payout. Critical financial operation |
+| **PayoutCancel** | `hyperswitch.payouts.cancel` | ✅ Persistent | X-Merchant-Id, X-Payout-Id | Cancels payout. Needs audit trail |
+| **PayoutSync** | `hyperswitch.payouts.sync` | ⚡ Request/Reply | X-Merchant-Id, X-Payout-Id | Checks payout status. Real-time query |
 
 ### Special Operations → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream Suitable | Description |
-|--------------|--------------|-------------------|-------------|
-| **TaxCalculation** | `hyperswitch.tax.{merchant_id}.calculate` | ⚡ No - Request/Reply | Calculates tax. Real-time calculation |
-| **FraudCheck** | `hyperswitch.fraud.{merchant_id}.check` | ✅ Yes - Analytics | Fraud detection. Needs analysis/ML pipeline |
-| **GiftCardBalanceCheck** | `hyperswitch.giftcard.{merchant_id}.balance` | ⚡ No - Request/Reply | Checks gift card balance. Real-time query |
+| Trait/Method | NATS Subject | JetStream | Headers | Description |
+|--------------|--------------|-----------|---------|-------------|
+| **TaxCalculation** | `hyperswitch.tax.calculate` | ⚡ Request/Reply | X-Merchant-Id | Calculates tax. Real-time calculation |
+| **FraudCheck** | `hyperswitch.fraud.check` | ✅ Analytics | X-Merchant-Id, X-Payment-Id | Fraud detection. Needs analysis/ML pipeline |
+| **GiftCardBalanceCheck** | `hyperswitch.giftcard.balance` | ⚡ Request/Reply | X-Merchant-Id | Checks gift card balance. Real-time query |
 
 ### JetStream Decision Criteria
 
@@ -103,34 +117,120 @@
 ### Stream Configuration Recommendations
 
 ```yaml
-PAYMENT_STREAM:
+HYPERSWITCH_PAYMENTS:
   subjects:
     - "hyperswitch.payments.>"
-  retention: 30 days
-  replicas: 3
+  retention: limits
+  max_age: 30d
   storage: file
+  replicas: 3
+  duplicate_window: 5m  # Idempotency via Nats-Msg-Id
 
-REFUND_STREAM:
+HYPERSWITCH_REFUNDS:
   subjects:
     - "hyperswitch.refunds.>"
-  retention: 90 days
-  replicas: 3
+  retention: limits
+  max_age: 90d
   storage: file
+  replicas: 3
+  duplicate_window: 5m
 
-WEBHOOK_STREAM:
+HYPERSWITCH_WEBHOOKS:
   subjects:
     - "hyperswitch.webhooks.>"
-  retention: 7 days
-  replicas: 2
+  retention: limits
+  max_age: 7d
   storage: file
+  replicas: 2
+  duplicate_window: 5m
 
-DISPUTE_STREAM:
+HYPERSWITCH_DISPUTES:
   subjects:
     - "hyperswitch.disputes.>"
-  retention: 365 days  # Legal requirement
-  replicas: 3
+  retention: limits
+  max_age: 365d  # Legal requirement
   storage: file
+  replicas: 3
+  duplicate_window: 5m
 ```
+
+---
+
+## Option D Implementation Notes
+
+### Message Publishing Pattern (Hyperswitch → NATS)
+
+```rust
+// Publish with Option D (headers + body)
+let headers = Headers::new()
+    .insert("Nats-Msg-Id", &format!("{}_{}", payment_id, attempt_id))  // Idempotency
+    .insert("X-Merchant-Id", &merchant_id)                             // Observability
+    .insert("X-Payment-Id", &payment_id)                               // Observability
+    .insert("X-Correlation-Id", &correlation_id);                      // Tracing
+
+let body = serde_json::to_vec(&PaymentMessage {
+    merchant_id: merchant_id.clone(),  // Authoritative
+    payment_id: payment_id.clone(),
+    router_data: router_data,
+})?;
+
+jetstream.publish_with_headers(
+    "hyperswitch.payments.authorize",
+    headers,
+    body
+).await?;
+```
+
+### Message Consumption Pattern (Worker)
+
+```rust
+async fn process_message(msg: Message) -> Result<()> {
+    // OPTIONAL: Fast check via headers (observability/logging)
+    let merchant_header = msg.headers.get("X-Merchant-Id");
+
+    // REQUIRED: Parse body (authoritative for processing)
+    let payment: PaymentMessage = serde_json::from_slice(&msg.payload)?;
+
+    // OPTIONAL: Validate consistency (catch serialization bugs)
+    if let Some(header) = merchant_header {
+        if header != &payment.merchant_id {
+            log::warn!(
+                "Header/body mismatch: header={} body={} - using body",
+                header, payment.merchant_id
+            );
+        }
+    }
+
+    // ALWAYS use body for business logic
+    process_payment(&payment.merchant_id, &payment.router_data).await
+}
+```
+
+### Key Implementation Rules
+
+1. **Subject Structure**: No merchant_id in subjects
+   - ✅ `hyperswitch.payments.authorize`
+   - ❌ `hyperswitch.payments.{merchant_id}.authorize`
+
+2. **Headers**: merchant_id + entity IDs for observability
+   - Required: `X-Merchant-Id`, `X-Correlation-Id`, `Nats-Msg-Id`
+   - Operation-specific: `X-Payment-Id`, `X-Refund-Id`, etc.
+
+3. **Body**: Complete RouterData with merchant_id
+   - Body is ALWAYS authoritative
+   - Headers are metadata for NATS layer
+
+4. **Worker Subscriptions**: No wildcards needed
+   - ✅ `hyperswitch.payments.authorize` (all merchants)
+   - ✅ `hyperswitch.payments.>` (all payment operations)
+   - ❌ `hyperswitch.payments.*.authorize` (no need for wildcards)
+
+5. **Validation**: Optional but recommended
+   - Check header/body consistency on message receipt
+   - Log mismatches as warnings (indicates serialization bug)
+   - Always trust body for processing
+
+---
 
 ## Phase 0: Pre-Implementation Requirements
 
@@ -512,28 +612,35 @@ DISPUTE_STREAM:
 ### Debug Commands
 ```bash
 # Monitor all payment messages
-nats sub "hyperswitch.payments.>"
+nats sub "hyperswitch.payments.>" --headers
 
 # Check stream status
-nats stream info PAYMENTS
+nats stream info HYPERSWITCH_PAYMENTS
 
 # View consumer status
-nats consumer info PAYMENTS hyperswitch-consumer
+nats consumer info HYPERSWITCH_PAYMENTS payment-processor
 
-# Publish test message
-echo '{"test": "data"}' | nats pub hyperswitch.payments.test.authorize
+# Publish test message with Option D format
+nats pub hyperswitch.payments.authorize \
+  --header "X-Merchant-Id:merchant_123" \
+  --header "X-Payment-Id:pay_test" \
+  '{"merchant_id":"merchant_123","payment_id":"pay_test","router_data":{}}'
 
 # Check message in stream
-nats stream get PAYMENTS 1
+nats stream get HYPERSWITCH_PAYMENTS 1
 
-# Monitor specific merchant
-nats sub "hyperswitch.payments.merchant_123.>"
+# Monitor specific merchant via headers (requires filtering in consumer)
+nats sub "hyperswitch.payments.>" --headers | grep "X-Merchant-Id:merchant_123"
 
 # Check worker subscriptions
 nats server report connections
 
 # View stream statistics
 nats stream report
+
+# Verify Option D consistency (headers match body)
+nats sub "hyperswitch.payments.>" --headers | \
+  jq -r 'select(.headers["X-Merchant-Id"] != .merchant_id)'
 ```
 
 ### Troubleshooting Checklist
@@ -584,9 +691,15 @@ Before marking the connector as production-ready:
 
 ## Timeline Estimate
 
-- Phase 1-3: 1 week
-- Phase 4-6: 2 weeks
-- Phase 7-9: 1 week
-- Phase 10-12: 2 weeks
+- Phase 1-3: 1 week (MVP - Core payments + refunds)
+- Phase 4-6: 2 weeks (Production - JetStream + workers)
+- Phase 7-9: 1 week (Quality - Testing + monitoring)
+- Phase 10-12: 2 weeks (Enterprise - Security + advanced features)
 
 Total estimated time: 6 weeks for full implementation
+
+---
+
+## Related Documentation
+
+- **[NATS.md](./NATS.md)** - Complete protocol guide with worker examples
