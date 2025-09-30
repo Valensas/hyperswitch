@@ -5984,6 +5984,10 @@ key1 = "Merchant Token"
 [[loonio.bank_redirect]]
 payment_method_type = "interac"
 
+[nats_bridge]
+[nats_bridge.connector_auth.HeaderKey]
+api_key = "API Key"
+
 [tesouro]
 [[tesouro.credit]]
 payment_method_type = "Mastercard"

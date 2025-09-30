@@ -419,6 +419,9 @@ impl ConnectorData {
                 enums::Connector::Multisafepay => {
                     Ok(ConnectorEnum::Old(Box::new(connector::Multisafepay::new())))
                 }
+                enums::Connector::NatsBridge => {
+                    Ok(ConnectorEnum::Old(Box::new(connector::NatsBridge::new() as &_)))
+                }
                 enums::Connector::Netcetera => {
                     Ok(ConnectorEnum::Old(Box::new(&connector::Netcetera)))
                 }

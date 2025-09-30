@@ -304,6 +304,7 @@ pub struct ConnectorConfig {
     pub moneris: Option<ConnectorTomlConfig>,
     pub mpgs: Option<ConnectorTomlConfig>,
     pub multisafepay: Option<ConnectorTomlConfig>,
+    pub nats_bridge: Option<ConnectorTomlConfig>,
     pub nexinets: Option<ConnectorTomlConfig>,
     pub nexixpay: Option<ConnectorTomlConfig>,
     pub nmi: Option<ConnectorTomlConfig>,
@@ -522,6 +523,7 @@ impl ConnectorConfig {
             Connector::Mollie => Ok(connector_data.mollie),
             Connector::Moneris => Ok(connector_data.moneris),
             Connector::Multisafepay => Ok(connector_data.multisafepay),
+            Connector::NatsBridge => Ok(None), // NATS bridge configured via base_url only
             Connector::Nexinets => Ok(connector_data.nexinets),
             Connector::Nexixpay => Ok(connector_data.nexixpay),
             Connector::Prophetpay => Ok(connector_data.prophetpay),
