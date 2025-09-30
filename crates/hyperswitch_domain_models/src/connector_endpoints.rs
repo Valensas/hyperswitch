@@ -85,6 +85,7 @@ pub struct Connectors {
     pub moneris: ConnectorParams,
     pub mpgs: ConnectorParams,
     pub multisafepay: ConnectorParams,
+    pub nats_bridge: ConnectorParams,
     pub netcetera: ConnectorParams,
     pub nexinets: ConnectorParams,
     pub nexixpay: ConnectorParams,

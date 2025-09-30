@@ -71,6 +71,7 @@ mod mollie;
 mod moneris;
 mod mpgs;
 mod multisafepay;
+mod nats_bridge;
 mod netcetera;
 mod nexinets;
 mod nexixpay;
