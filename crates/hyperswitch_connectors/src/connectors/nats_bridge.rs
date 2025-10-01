@@ -9,7 +9,7 @@ use common_utils::{
     request::Request,
     types::{AmountConvertor, StringMinorUnit, StringMinorUnitForConnector},
 };
-use crate::utils::RefundsRequestData;
+use crate::{types::ResponseRouterData, utils::RefundsRequestData};
 use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
@@ -27,7 +27,7 @@ use hyperswitch_domain_models::{
         ConnectorInfo, PaymentsResponseData, RefundsResponseData, SupportedPaymentMethods,
     },
     types::{
-        PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData,
+        PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData,
         PaymentsSyncRouterData, RefundSyncRouterData, RefundsRouterData,
     },
 };
@@ -66,7 +66,6 @@ static NATS_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 const SUBJECT_PAYMENTS_AUTHORIZE: &str = "hyperswitch.payments.authorize";
 const SUBJECT_PAYMENTS_COMPLETE_AUTHORIZE: &str = "hyperswitch.payments.complete_authorize";
 const SUBJECT_PAYMENTS_CAPTURE: &str = "hyperswitch.payments.capture";
-#[allow(dead_code)] // Will be used when Void operation is implemented
 const SUBJECT_PAYMENTS_VOID: &str = "hyperswitch.payments.void";
 const SUBJECT_PAYMENTS_SYNC: &str = "hyperswitch.payments.sync";
 const SUBJECT_REFUNDS_EXECUTE: &str = "hyperswitch.refunds.execute";
@@ -291,7 +290,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        RouterData::try_from(crate::types::ResponseRouterData {
+        RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
@@ -383,7 +382,7 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        RouterData::try_from(crate::types::ResponseRouterData {
+        RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
@@ -457,7 +456,7 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Nat
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        RouterData::try_from(crate::types::ResponseRouterData {
+        RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
@@ -543,7 +542,7 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        RouterData::try_from(crate::types::ResponseRouterData {
+        RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
@@ -559,8 +558,101 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
     }
 }
 
+// ============================================================================
+// VOID - JetStream + Request-Reply Hybrid (Financial Operation)
+// ============================================================================
 impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for NatsBridge {
-    // TODO: Implement void via hyperswitch.payments.void
+    fn build_request(
+        &self,
+        req: &PaymentsCancelRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        let nats_url = self.base_url(connectors);
+        let headers = self.build_nats_headers(req);
+
+        // For void operations, amount is optional (typically cancels the entire authorization)
+        // Use minor_amount if provided, otherwise use zero
+        let amount = if let Some(minor_amount) = req.request.minor_amount {
+            let currency = req.request.currency.ok_or(
+                errors::ConnectorError::MissingRequiredField { field_name: "currency" }
+            )?;
+            utils::convert_amount(self.amount_converter, minor_amount, currency)?
+        } else {
+            // No amount specified - void the entire payment (use zero as placeholder)
+            // Use any currency since amount is zero - currency doesn't matter
+            let zero_amount = common_utils::types::MinorUnit::new(0);
+            self.amount_converter
+                .convert(zero_amount, enums::Currency::USD)
+                .change_context(errors::ConnectorError::RequestEncodingFailed)?
+        };
+
+        let connector_router_data = nats_bridge::NatsBridgeRouterData::from((amount, req));
+        let connector_req = nats_bridge::NatsBridgeVoidRequest::try_from(&connector_router_data)?;
+
+        // Use hybrid JetStream + request-reply pattern (financial operation needs persistence)
+        let response_payload = tokio::task::block_in_place(|| {
+            NATS_RUNTIME.block_on(async {
+                let cache = NatsClientCache::global();
+                let client = cache.get_client(nats_url).await?;
+                let jetstream = cache.get_jetstream(&client).await?;
+
+                cache
+                    .publish_with_response(
+                        &jetstream,
+                        &client,
+                        SUBJECT_PAYMENTS_VOID,
+                        headers,
+                        &connector_req,
+                        TIMEOUT_AUTHORIZE,
+                    )
+                    .await
+            })
+        })?;
+
+        router_env::logger::info!(
+            payment_id = ?req.payment_id,
+            attempt_id = ?req.attempt_id,
+            "Received void response from worker (via JetStream + inbox)"
+        );
+
+        Ok(Some(
+            common_utils::request::RequestBuilder::new()
+                .method(common_utils::request::Method::Post)
+                .url(&format!("nats://{}", SUBJECT_PAYMENTS_VOID))
+                .set_body(common_utils::request::RequestContent::RawBytes(response_payload.to_vec()))
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &PaymentsCancelRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<PaymentsCancelRouterData, errors::ConnectorError> {
+        let response: nats_bridge::NatsBridgePaymentsResponse = res
+            .response
+            .parse_struct("NatsBridgePaymentsResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+
+        router_env::logger::info!(connector_response=?response);
+
+        event_builder.map(|event| event.set_response_body(&response));
+
+        RouterData::try_from(ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
 }
 
 // ============================================================================
@@ -632,7 +724,7 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for NatsBri
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        RouterData::try_from(crate::types::ResponseRouterData {
+        RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
@@ -710,7 +802,7 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for NatsBridg
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
 
-        RouterData::try_from(crate::types::ResponseRouterData {
+        RouterData::try_from(ResponseRouterData {
             response,
             data: data.clone(),
             http_code: res.status_code,
