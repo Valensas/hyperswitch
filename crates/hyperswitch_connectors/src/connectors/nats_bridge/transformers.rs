@@ -8,7 +8,7 @@ use hyperswitch_domain_models::{
     router_flow_types::refunds::{Execute, RSync},
     router_request_types::ResponseId,
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
-    types::{PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData, PaymentsSyncRouterData, RefundsRouterData},
+    types::{PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData, PaymentsSyncRouterData, RefundsRouterData},
 };
 use hyperswitch_interfaces::errors;
 use masking::{ExposeInterface, Secret};
@@ -163,6 +163,32 @@ impl TryFrom<&NatsBridgeRouterData<&PaymentsCaptureRouterData>> for NatsBridgeCa
                 .request
                 .connector_transaction_id
                 .clone(),
+        })
+    }
+}
+
+/// Void Request (Payment Cancellation)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NatsBridgeVoidRequest {
+    pub connector_transaction_id: String,
+    pub cancellation_reason: Option<String>,
+    pub amount: Option<String>,
+    pub currency: Option<enums::Currency>,
+}
+
+impl TryFrom<&NatsBridgeRouterData<&PaymentsCancelRouterData>> for NatsBridgeVoidRequest {
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: &NatsBridgeRouterData<&PaymentsCancelRouterData>,
+    ) -> Result<Self, Self::Error> {
+        let router_data = item.router_data;
+
+        Ok(Self {
+            connector_transaction_id: router_data.request.connector_transaction_id.clone(),
+            cancellation_reason: router_data.request.cancellation_reason.clone(),
+            amount: Some(item.amount.to_string()),
+            currency: router_data.request.currency,
         })
     }
 }
