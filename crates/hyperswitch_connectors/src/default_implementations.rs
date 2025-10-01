@@ -1268,7 +1268,6 @@ default_imp_for_complete_authorize!(
     connectors::Moneris,
     connectors::Mpgs,
     connectors::Multisafepay,
-    connectors::NatsBridge,
     connectors::Netcetera,
     connectors::Nomupay,
     connectors::Noon,

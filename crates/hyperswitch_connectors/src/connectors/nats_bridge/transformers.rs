@@ -8,10 +8,10 @@ use hyperswitch_domain_models::{
     router_flow_types::refunds::{Execute, RSync},
     router_request_types::ResponseId,
     router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
-    types::{PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsSyncRouterData, RefundsRouterData},
+    types::{PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData, PaymentsSyncRouterData, RefundsRouterData},
 };
 use hyperswitch_interfaces::errors;
-use masking::Secret;
+use masking::{ExposeInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{RefundsResponseRouterData, ResponseRouterData};
@@ -100,6 +100,42 @@ impl TryFrom<&NatsBridgeRouterData<&PaymentsAuthorizeRouterData>> for NatsBridge
             }),
             statement_descriptor: request.statement_descriptor.clone(),
             metadata: None,
+        })
+    }
+}
+
+/// CompleteAuthorize Request (3DS/2FA completion)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NatsBridgeCompleteAuthorizeRequest {
+    pub amount: String,
+    pub currency: enums::Currency,
+    pub payment_method_data: Option<serde_json::Value>,
+    pub connector_transaction_id: Option<String>,
+    pub redirect_params: Option<String>,
+    pub redirect_payload: Option<serde_json::Value>,
+}
+
+impl TryFrom<&NatsBridgeRouterData<&PaymentsCompleteAuthorizeRouterData>>
+    for NatsBridgeCompleteAuthorizeRequest
+{
+    type Error = error_stack::Report<errors::ConnectorError>;
+
+    fn try_from(
+        item: &NatsBridgeRouterData<&PaymentsCompleteAuthorizeRouterData>,
+    ) -> Result<Self, Self::Error> {
+        let router_data = item.router_data;
+
+        Ok(Self {
+            amount: item.amount.to_string(),
+            currency: router_data.request.currency,
+            payment_method_data: router_data.request.payment_method_data.as_ref().map(|pmd| {
+                serde_json::to_value(pmd).unwrap_or(serde_json::Value::Null)
+            }),
+            connector_transaction_id: router_data.request.connector_transaction_id.clone(),
+            redirect_params: router_data.request.redirect_response.as_ref()
+                .and_then(|rr| rr.params.as_ref().map(|p| p.clone().expose())),
+            redirect_payload: router_data.request.redirect_response.as_ref()
+                .and_then(|rr| rr.payload.as_ref().map(|p| p.clone().expose())),
         })
     }
 }
