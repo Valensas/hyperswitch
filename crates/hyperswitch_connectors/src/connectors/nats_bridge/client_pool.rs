@@ -14,41 +14,40 @@ use router_env::logger;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-/// Global NATS client cache
+/// Global NATS client
 /// Note: NATS Client is cheaply cloneable - cloning just clones an Arc internally
-static NATS_CLIENT_CACHE: Lazy<NatsClientCache> = Lazy::new(NatsClientCache::new);
+/// async-nats handles reconnection automatically, so we don't need to check connection state
+static NATS_CLIENT: Lazy<RwLock<Option<Client>>> = Lazy::new(|| RwLock::new(None));
 
-/// NATS Client Cache - stores one client per URL
+/// NATS Client Cache - simplified single client management
 /// The client itself can be cloned cheaply and shared across threads
-pub struct NatsClientCache {
-    clients: RwLock<std::collections::HashMap<String, Client>>,
-}
+pub struct NatsClientCache;
 
 impl NatsClientCache {
-    fn new() -> Self {
-        Self {
-            clients: RwLock::new(std::collections::HashMap::new()),
-        }
-    }
-
     /// Get global instance
     pub fn global() -> &'static Self {
-        &NATS_CLIENT_CACHE
+        &NatsClientCache
     }
 
     /// Get or create NATS client for given URL
     /// Returns a clone of the client - cloning is cheap (just an Arc clone internally)
+    /// async-nats handles reconnection automatically
     pub async fn get_client(&self, nats_url: &str) -> CustomResult<Client, errors::ConnectorError> {
-        // Check if client exists and is connected
+        // Fast path: return existing client
         {
-            let clients = self.clients.read().await;
-            if let Some(client) = clients.get(nats_url) {
-                if client.connection_state() == async_nats::connection::State::Connected {
-                    // Clone is cheap - just clones an Arc internally
-                    return Ok(client.clone());
-                }
-                logger::warn!("NATS connection dead, will reconnect: {}", nats_url);
+            let client_guard = NATS_CLIENT.read().await;
+            if let Some(client) = client_guard.as_ref() {
+                // Clone is cheap - just clones an Arc internally
+                return Ok(client.clone());
             }
+        }
+
+        // Slow path: initialize client once
+        let mut client_guard = NATS_CLIENT.write().await;
+
+        // Double-check: another thread might have initialized while we waited for lock
+        if let Some(client) = client_guard.as_ref() {
+            return Ok(client.clone());
         }
 
         // Create new client
@@ -59,13 +58,10 @@ impl NatsClientCache {
             )))
             .attach_printable_lazy(|| format!("NATS URL: {}", nats_url))?;
 
-        logger::info!("Connected to NATS: {}", nats_url);
+        logger::info!("Connected to NATS: {} (async-nats will handle reconnection automatically)", nats_url);
 
-        // Store in cache
-        {
-            let mut clients = self.clients.write().await;
-            clients.insert(nats_url.to_string(), client.clone());
-        }
+        // Store client
+        *client_guard = Some(client.clone());
 
         Ok(client)
     }
@@ -325,18 +321,27 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Only run with actual NATS server
-    async fn test_client_cache() {
+    async fn test_client_initialization() {
         let cache = NatsClientCache::global();
-        let client = cache.get_client("nats://localhost:4222").await.unwrap();
+
+        // First call initializes the client
+        let client1 = cache.get_client("nats://localhost:4222").await.unwrap();
         assert_eq!(
-            client.connection_state(),
+            client1.connection_state(),
             async_nats::connection::State::Connected
         );
 
-        // Cloning the client is cheap
-        let client2 = client.clone();
+        // Second call returns the same client (cheap Arc clone)
+        let client2 = cache.get_client("nats://localhost:4222").await.unwrap();
         assert_eq!(
             client2.connection_state(),
+            async_nats::connection::State::Connected
+        );
+
+        // Cloning the client is cheap - just clones an Arc
+        let client3 = client1.clone();
+        assert_eq!(
+            client3.connection_state(),
             async_nats::connection::State::Connected
         );
     }

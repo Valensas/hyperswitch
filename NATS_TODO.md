@@ -286,11 +286,11 @@ counter_metric!(NATS_RECOVERY_JOB_FAILED_COUNT, GLOBAL_METER);
 **Status:** Pending Phase 1 completion
 
 ### 2.1 Simplified Connection Management
-- [ ] Remove HashMap-based client cache
-- [ ] Implement single client with Lazy initialization
-- [ ] Remove manual connection state checks
-- [ ] Trust async-nats built-in reconnection
-- [ ] Add connection state monitoring (metrics only)
+- [x] Remove HashMap-based client cache
+- [x] Implement single client with Lazy initialization
+- [x] Remove manual connection state checks
+- [x] Trust async-nats built-in reconnection
+- [ ] Add connection state monitoring (metrics only) - OPTIONAL
 
 **Simplified Pattern:**
 ```rust
