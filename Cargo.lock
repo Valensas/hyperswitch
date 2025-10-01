@@ -4091,6 +4091,7 @@ dependencies = [
  "crypto",
  "encoding_rs",
  "error-stack 0.4.1",
+ "futures 0.3.31",
  "hex",
  "html-escape",
  "http 0.2.12",

@@ -1,4 +1,376 @@
-# NATS Bridge Connector - Implementation TODO
+# NATS Bridge Connector - Production Readiness & Implementation TODO
+
+## 🔴 CRITICAL: Production Readiness Assessment (2025-01-XX)
+
+### **Status: ❌ NOT PRODUCTION READY**
+
+After comprehensive review with HyperArchitect, NatsArchitect, and DomainArchitect, plus deep research into NATS best practices from:
+- https://natsbyexample.com
+- https://docs.nats.io
+- https://github.com/nats-io/nats.rs
+
+**Critical Issue Identified:** Using ephemeral Core NATS request-reply for financial operations.
+
+### **The Problem**
+
+Current implementation uses **Core NATS request-reply** (at-most-once delivery) for ALL operations including:
+- ❌ Payment authorization
+- ❌ Payment capture
+- ❌ Refunds
+
+This violates NATS best practices for financial operations:
+- ❌ No persistence (worker crash = lost payment)
+- ❌ No idempotency enforcement (Nats-Msg-Id header ignored without JetStream)
+- ❌ No audit trail (messages disappear after processing)
+- ❌ No message replay (cannot recover from failures)
+
+### **Required Fix: Hybrid JetStream + Request-Reply Pattern**
+
+**Financial Operations** → JetStream publish + inbox for response
+**Query Operations** → Core NATS request-reply (current pattern is fine)
+
+---
+
+## 📋 Phase 1: Critical Fixes (REQUIRED FOR PRODUCTION)
+
+**Timeline:** 5-7 days  
+**Status:** Starting now
+
+### 1.1 JetStream Infrastructure
+- [x] Add JetStream stream creation for HYPERSWITCH_PAYMENTS
+- [x] Configure deduplication window (5 minutes)
+- [x] Set up persistence (file-based storage)
+- [x] Configure replicas (3 for HA)
+
+```rust
+// Stream configuration needed
+let stream_config = jetstream::stream::Config {
+    name: "HYPERSWITCH_PAYMENTS".to_string(),
+    subjects: vec!["hyperswitch.payments.>".to_string()],
+    duplicate_window: Duration::from_secs(300), // 5 minutes
+    retention: RetentionPolicy::Limits,
+    max_age: Duration::from_secs(30 * 24 * 60 * 60), // 30 days
+    storage: StorageType::File,
+    num_replicas: 3,
+    ..Default::default()
+};
+```
+
+### 1.2 Hybrid Request-Reply Implementation
+- [x] Create `publish_with_response()` method in client_pool.rs
+- [x] Implement JetStream publish + inbox pattern
+- [x] Add 2-phase timeout (2s for JetStream ACK, 28s for worker response)
+- [x] Update authorize() to use hybrid pattern
+- [x] Update capture() to use hybrid pattern
+- [x] Update refund execute() to use hybrid pattern
+
+**Key Implementation:**
+```rust
+pub async fn publish_with_response<T: Serialize>(
+    &self,
+    jetstream: &jetstream::Context,
+    client: &Client,
+    subject: &str,
+    headers: HeaderMap,
+    payload: &T,
+    timeout: Duration,
+) -> CustomResult<Bytes, errors::ConnectorError> {
+    // 1. Create inbox for response
+    let inbox = client.new_inbox();
+    let mut sub = client.subscribe(inbox.clone()).await?;
+    
+    // 2. Add reply-to header
+    headers.insert("Nats-Reply-To", inbox.as_str());
+    
+    // 3. Publish to JetStream (persistence + idempotency)
+    let ack = tokio::time::timeout(
+        Duration::from_secs(2),
+        jetstream.publish_with_headers(subject, headers, payload)
+    ).await??.await?;
+    
+    // 4. Wait for worker response
+    let response = tokio::time::timeout(timeout, sub.next()).await??;
+    Ok(response.payload)
+}
+```
+
+### 1.3 Worker ACK Pattern Documentation
+- [ ] Document explicit ACK requirement for workers
+- [ ] Create Python worker example with ACK
+- [ ] Create Go worker example with ACK
+- [ ] Update NATS.md with ACK patterns
+
+**Worker Pattern:**
+```python
+async def handle_authorize(msg):
+    # Process payment
+    result = await process_stripe_payment(msg.data)
+    
+    # Send response to reply-to inbox
+    reply_to = msg.headers.get('Nats-Reply-To')
+    if reply_to:
+        await msg._client.publish(reply_to, json.dumps(result))
+    
+    # CRITICAL: ACK after everything succeeded
+    await msg.ack()
+```
+
+### 1.4 Timeout Recovery Job
+
+**Purpose:** Automatically mark payments as "Failed" when NATS workers don't respond within the timeout window. This prevents payments from being stuck in limbo indefinitely.
+
+**Implementation Requirements:**
+
+- [ ] Create background scheduler job in `crates/scheduler/src/workflows/`
+- [ ] Scan for payments stuck in transitional states
+- [ ] Mark stuck payments (>5 minutes for 30s timeout operations) as "Failed"
+- [ ] Add metrics for recovery job execution
+- [ ] Run job every 1 minute
+
+**Affected Payment States:**
+- `Started` - Payment initiated but no response
+- `Authorizing` - Authorize sent to worker, no response
+- `Pending` - Waiting for worker action
+
+**Timeout Thresholds:**
+- **Normal operations** (authorize, capture, refund): 30s timeout → mark failed after **5 minutes**
+- **Sync operations**: 5s timeout → mark failed after **2 minutes**
+
+**Implementation Sketch:**
+
+```rust
+// File: crates/scheduler/src/workflows/nats_payment_recovery.rs
+
+use common_utils::errors::CustomResult;
+use diesel_models::{enums as storage_enums, PaymentAttempt};
+use error_stack::ResultExt;
+use router_env::logger;
+use storage_impl::StorageInterface;
+
+/// Recovery job for NATS bridge payments stuck in transitional states
+pub async fn cleanup_stuck_nats_payments(
+    db: &dyn StorageInterface,
+) -> CustomResult<(), errors::SchedulerError> {
+    logger::info!("Starting NATS payment recovery job");
+
+    // Query payments stuck in transitional states for nats_bridge connector
+    let stuck_payments = db
+        .find_payment_attempts_by_connector_and_statuses(
+            "nats_bridge",
+            vec![
+                storage_enums::AttemptStatus::Started,
+                storage_enums::AttemptStatus::Authorizing,
+                storage_enums::AttemptStatus::Pending,
+            ],
+            chrono::Duration::minutes(5), // Older than 5 minutes
+        )
+        .await
+        .change_context(errors::SchedulerError::DatabaseError)?;
+
+    logger::info!(
+        "Found {} stuck NATS payments to recover",
+        stuck_payments.len()
+    );
+
+    let mut recovered_count = 0;
+    let mut failed_count = 0;
+
+    for payment in stuck_payments {
+        match mark_payment_as_timeout_failed(db, payment).await {
+            Ok(_) => {
+                recovered_count += 1;
+            }
+            Err(e) => {
+                failed_count += 1;
+                logger::error!(
+                    payment_id = ?payment.payment_id,
+                    attempt_id = ?payment.attempt_id,
+                    "Failed to recover stuck payment: {:?}",
+                    e
+                );
+            }
+        }
+    }
+
+    logger::info!(
+        "NATS recovery job completed: recovered={}, failed={}",
+        recovered_count,
+        failed_count
+    );
+
+    // Emit metrics
+    metrics::NATS_RECOVERY_JOB_RECOVERED_COUNT.add(recovered_count, &[]);
+    metrics::NATS_RECOVERY_JOB_FAILED_COUNT.add(failed_count, &[]);
+
+    Ok(())
+}
+
+async fn mark_payment_as_timeout_failed(
+    db: &dyn StorageInterface,
+    payment: PaymentAttempt,
+) -> CustomResult<(), errors::SchedulerError> {
+    let update = storage_models::PaymentAttemptUpdate::ErrorUpdate {
+        connector: Some(payment.connector.clone()),
+        status: storage_enums::AttemptStatus::Failure,
+        error_code: Some("CONNECTOR_TIMEOUT".to_string()),
+        error_message: Some("NATS worker timeout - no response received within threshold".to_string()),
+        error_reason: Some("Worker did not respond within 30 seconds, marked as failed by recovery job".to_string()),
+        amount_capturable: None,
+        updated_by: "nats_recovery_job".to_string(),
+    };
+
+    db.update_payment_attempt(payment, update)
+        .await
+        .change_context(errors::SchedulerError::DatabaseError)?;
+
+    logger::warn!(
+        payment_id = ?payment.payment_id,
+        attempt_id = ?payment.attempt_id,
+        "Marked stuck NATS payment as failed"
+    );
+
+    Ok(())
+}
+```
+
+**Scheduler Configuration:**
+
+Add to `crates/scheduler/src/configs.rs`:
+```rust
+pub const NATS_RECOVERY_JOB_INTERVAL_SECS: u64 = 60; // Run every 1 minute
+```
+
+**Additional Metrics Needed:**
+
+Add to `crates/hyperswitch_connectors/src/metrics.rs`:
+```rust
+counter_metric!(NATS_RECOVERY_JOB_RECOVERED_COUNT, GLOBAL_METER);
+counter_metric!(NATS_RECOVERY_JOB_FAILED_COUNT, GLOBAL_METER);
+```
+
+**Testing Strategy:**
+1. Create test payment with nats_bridge connector
+2. Force it into "Authorizing" state
+3. Wait 5+ minutes
+4. Verify recovery job marks it as "Failed"
+5. Check error message includes "CONNECTOR_TIMEOUT"
+
+**Monitoring & Alerts:**
+- Alert if `NATS_RECOVERY_JOB_RECOVERED_COUNT` > 10/hour (indicates worker issues)
+- Alert if `NATS_RECOVERY_JOB_FAILED_COUNT` > 0 (indicates database issues)
+- Dashboard: Track recovery job execution time and recovered payment count over time
+
+### 1.5 CompleteAuthorize (3DS) Implementation
+- [x] Implement ConnectorIntegration for CompleteAuthorize
+- [x] Use hybrid JetStream pattern (needs synchronous redirect URL)
+- [x] Subject: hyperswitch.payments.complete_authorize
+- [x] Timeout: 30 seconds
+- [ ] Test with 3DS redirect flow
+
+### 1.6 Basic Observability
+- [x] Add metrics for NATS operations
+  - `nats_request_duration_seconds` (histogram with p50, p95, p99)
+  - `nats_timeout_count` (counter)
+  - `nats_jetstream_publish_errors` (counter)
+  - `nats_worker_response_success` (counter)
+  - `nats_jetstream_ack_success` (counter)
+- [x] Add structured logging with correlation IDs
+- [x] Log JetStream ACK sequence numbers
+- [ ] Alert on high timeout rates (Grafana/PagerDuty configuration)
+
+---
+
+## 📋 Phase 2: Production Hardening (RECOMMENDED FOR PRODUCTION)
+
+**Timeline:** 3-5 days after Phase 1  
+**Status:** Pending Phase 1 completion
+
+### 2.1 Simplified Connection Management
+- [ ] Remove HashMap-based client cache
+- [ ] Implement single client with Lazy initialization
+- [ ] Remove manual connection state checks
+- [ ] Trust async-nats built-in reconnection
+- [ ] Add connection state monitoring (metrics only)
+
+**Simplified Pattern:**
+```rust
+static NATS_CLIENT: Lazy<RwLock<Option<Client>>> = Lazy::new(|| RwLock::new(None));
+
+pub async fn get_client(nats_url: &str) -> Result<Client> {
+    // Fast path: return existing client
+    if let Some(client) = NATS_CLIENT.read().await.as_ref() {
+        return Ok(client.clone()); // Cheap Arc clone
+    }
+    
+    // Slow path: initialize once
+    let mut guard = NATS_CLIENT.write().await;
+    if guard.is_none() {
+        let client = async_nats::connect_with_options(nats_url, options).await?;
+        *guard = Some(client.clone());
+    }
+    Ok(guard.as_ref().unwrap().clone())
+}
+```
+
+### 2.2 Circuit Breaker
+- [ ] Implement circuit breaker for NATS operations
+- [ ] Track consecutive failures
+- [ ] Open circuit after 5 failures
+- [ ] Half-open state with probe requests
+- [ ] Add circuit breaker metrics
+
+### 2.3 Void Operation
+- [ ] Implement ConnectorIntegration for Void
+- [ ] Subject: hyperswitch.payments.void
+- [ ] Use hybrid JetStream pattern
+- [ ] Timeout: 30 seconds
+
+### 2.4 Connection Health Monitoring
+- [ ] Spawn background task to monitor connection state
+- [ ] Emit metrics on state transitions
+- [ ] Log warnings on reconnection attempts
+- [ ] Alert on prolonged disconnections
+
+### 2.5 Load Testing
+- [ ] Create load test scenarios (JMeter or k6)
+- [ ] Test 1000 req/s throughput
+- [ ] Measure p95/p99 latencies
+- [ ] Test worker failure scenarios
+- [ ] Test NATS server restart recovery
+
+---
+
+## 📋 Phase 3: Advanced Features (OPTIONAL)
+
+**Timeline:** 5-7 days  
+**Status:** Post-production
+
+### 3.1 Webhook Receiver
+- [ ] Implement IncomingWebhook trait
+- [ ] Subscribe to hyperswitch.webhooks.incoming
+- [ ] Parse worker async updates
+- [ ] Update payment status from webhooks
+
+### 3.2 Dead Letter Queue (DLQ)
+- [ ] Create HYPERSWITCH_PAYMENTS_DLQ stream
+- [ ] Configure max delivery attempts (5)
+- [ ] Route failed messages to DLQ
+- [ ] Add DLQ monitoring dashboard
+- [ ] Create DLQ replay tool
+
+### 3.3 Message Replay UI
+- [ ] Build admin UI for JetStream message replay
+- [ ] Filter messages by merchant_id, payment_id
+- [ ] Replay failed operations
+- [ ] Track replay history
+
+### 3.4 Advanced Monitoring
+- [ ] Create Grafana dashboards
+- [ ] Add alerting rules (PagerDuty/Slack)
+- [ ] Implement distributed tracing (OpenTelemetry)
+- [ ] Add log aggregation (ELK stack)
+
+---
 
 ## Protocol Summary
 
@@ -7,10 +379,9 @@
 ```
 Subject:  hyperswitch.payments.authorize  (NO merchant_id)
 Headers:  X-Merchant-Id: merchant_123      (for NATS observability)
+          Nats-Msg-Id: pay_123_attempt_456 (for JetStream deduplication)
 Body:     { "merchant_id": "merchant_123", ... }  (authoritative)
 ```
-
-**Why**: Provides NATS-level observability without subject explosion, while keeping body authoritative.
 
 ---
 
@@ -18,103 +389,34 @@ Body:     { "merchant_id": "merchant_123", ... }  (authoritative)
 
 ### Core Payment Traits → NATS Operations
 
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **PaymentAuthorize** | `hyperswitch.payments.authorize` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Authorizes payment, holds funds. Critical operation requiring durability and replay capability |
-| **PaymentCapture** | `hyperswitch.payments.capture` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Captures authorized funds. Needs audit trail and idempotency |
-| **PaymentVoid** | `hyperswitch.payments.void` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Cancels authorized payment. Must be durable for reconciliation |
-| **PaymentSync** | `hyperswitch.payments.sync` | ⚡ Request/Reply | X-Merchant-Id, X-Payment-Id | Status check operation. Real-time response needed, no persistence required |
-| **PaymentSession** | `hyperswitch.payments.session` | ⚡ Request/Reply | X-Merchant-Id | Creates payment session tokens. Ephemeral, real-time operation |
-| **PaymentCompleteAuthorize** | `hyperswitch.payments.complete_authorize` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Completes 3DS/2FA authorization. Critical for payment completion |
-| **PaymentApprove** | `hyperswitch.payments.approve` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Manual payment approval. Needs audit trail |
-| **PaymentReject** | `hyperswitch.payments.reject` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Manual payment rejection. Needs audit trail |
-| **PaymentPostSessionTokens** | `hyperswitch.payments.post_session_tokens` | ⚡ Request/Reply | X-Merchant-Id | Updates session tokens. Ephemeral operation |
-| **PaymentIncrementalAuthorization** | `hyperswitch.payments.incremental_auth` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Increases authorization amount. Financial operation requiring durability |
-| **PaymentUpdateMetadata** | `hyperswitch.payments.update_metadata` | ✅ Persistent | X-Merchant-Id, X-Payment-Id | Updates payment metadata. Needs audit trail |
-
-### Refund Traits → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **RefundExecute** | `hyperswitch.refunds.execute` | ✅ Persistent | X-Merchant-Id, X-Refund-Id | Initiates refund. Critical financial operation |
-| **RefundSync** | `hyperswitch.refunds.sync` | ⚡ Request/Reply | X-Merchant-Id, X-Refund-Id | Checks refund status. Real-time query |
-| **RefundUpdate** | `hyperswitch.refunds.update` | ✅ Persistent | X-Merchant-Id, X-Refund-Id | Updates refund details. Needs audit trail |
-
-### Mandate/Recurring Traits → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **MandateSetup** | `hyperswitch.mandates.setup` | ✅ Persistent | X-Merchant-Id, X-Mandate-Id | Sets up recurring payment mandate. Long-term storage needed |
-| **MandateRevoke** | `hyperswitch.mandates.revoke` | ✅ Persistent | X-Merchant-Id, X-Mandate-Id | Cancels recurring mandate. Critical operation |
-| **MandateUpdate** | `hyperswitch.mandates.update` | ✅ Persistent | X-Merchant-Id, X-Mandate-Id | Updates mandate details. Needs versioning |
-
-### Token Management Traits → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **PaymentToken** | `hyperswitch.tokens.create` | ✅ Persistent | X-Merchant-Id, X-Token-Id | Creates payment token. Security-critical, needs audit |
-| **TokenValidate** | `hyperswitch.tokens.validate` | ⚡ Request/Reply | X-Merchant-Id, X-Token-Id | Validates token. Real-time check |
-| **TokenDelete** | `hyperswitch.tokens.delete` | ✅ Persistent | X-Merchant-Id, X-Token-Id | Deletes payment token. Compliance requirement |
-
-### Authentication Traits → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **ExternalAuthentication** | `hyperswitch.auth.external` | ⚡ Request/Reply | X-Merchant-Id, X-Payment-Id | 3DS/2FA authentication. Real-time operation |
-| **ConnectorAccessToken** | `hyperswitch.auth.access_token` | ⚡ Request/Reply | X-Merchant-Id, X-Connector | Gets connector access token. Short-lived tokens |
-| **ConnectorAuthenticationToken** | `hyperswitch.auth.auth_token` | ⚡ Request/Reply | X-Merchant-Id, X-Connector | Gets authentication token. Ephemeral |
-
-### Dispute Management Traits → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **AcceptDispute** | `hyperswitch.disputes.accept` | ✅ Persistent | X-Merchant-Id, X-Dispute-Id | Accepts dispute. Legal/compliance requirement |
-| **DefendDispute** | `hyperswitch.disputes.defend` | ✅ Persistent | X-Merchant-Id, X-Dispute-Id | Submits dispute evidence. Needs document trail |
-| **SubmitEvidence** | `hyperswitch.disputes.submit_evidence` | ✅ Persistent | X-Merchant-Id, X-Dispute-Id | Uploads dispute evidence. Document storage |
-
-### Webhook Traits → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **IncomingWebhook** | `hyperswitch.webhooks.incoming` | ✅ Persistent | X-Merchant-Id, X-Connector | Processes incoming webhooks. Must not lose events |
-| **VerifyWebhookSource** | `hyperswitch.webhooks.verify` | ⚡ Request/Reply | X-Merchant-Id, X-Connector | Verifies webhook signature. Real-time validation |
-
-### Payout Traits → NATS Operations (if enabled)
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **PayoutCreate** | `hyperswitch.payouts.create` | ✅ Persistent | X-Merchant-Id, X-Payout-Id | Creates payout. Financial operation |
-| **PayoutFulfill** | `hyperswitch.payouts.fulfill` | ✅ Persistent | X-Merchant-Id, X-Payout-Id | Executes payout. Critical financial operation |
-| **PayoutCancel** | `hyperswitch.payouts.cancel` | ✅ Persistent | X-Merchant-Id, X-Payout-Id | Cancels payout. Needs audit trail |
-| **PayoutSync** | `hyperswitch.payouts.sync` | ⚡ Request/Reply | X-Merchant-Id, X-Payout-Id | Checks payout status. Real-time query |
-
-### Special Operations → NATS Operations
-
-| Trait/Method | NATS Subject | JetStream | Headers | Description |
-|--------------|--------------|-----------|---------|-------------|
-| **TaxCalculation** | `hyperswitch.tax.calculate` | ⚡ Request/Reply | X-Merchant-Id | Calculates tax. Real-time calculation |
-| **FraudCheck** | `hyperswitch.fraud.check` | ✅ Analytics | X-Merchant-Id, X-Payment-Id | Fraud detection. Needs analysis/ML pipeline |
-| **GiftCardBalanceCheck** | `hyperswitch.giftcard.balance` | ⚡ Request/Reply | X-Merchant-Id | Checks gift card balance. Real-time query |
+| Trait/Method | NATS Subject | Pattern | Timeout | Priority |
+|--------------|--------------|---------|---------|----------|
+| **PaymentAuthorize** | `hyperswitch.payments.authorize` | JetStream + inbox | 30s | Phase 1 ✅ |
+| **PaymentCapture** | `hyperswitch.payments.capture` | JetStream + inbox | 30s | Phase 1 ✅ |
+| **PaymentVoid** | `hyperswitch.payments.void` | JetStream + inbox | 30s | Phase 2 |
+| **PaymentSync** | `hyperswitch.payments.sync` | Request/Reply | 5s | ✅ Done |
+| **PaymentSession** | `hyperswitch.payments.session` | Request/Reply | 5s | Future |
+| **PaymentCompleteAuthorize** | `hyperswitch.payments.complete_authorize` | JetStream + inbox | 30s | Phase 1 ✅ |
+| **RefundExecute** | `hyperswitch.refunds.execute` | JetStream + inbox | 30s | Phase 1 ✅ |
+| **RefundSync** | `hyperswitch.refunds.sync` | Request/Reply | 5s | ✅ Done |
 
 ### JetStream Decision Criteria
 
-**✅ Use JetStream for:**
+**✅ Use JetStream + Inbox for:**
 - Financial operations (authorize, capture, refund)
 - Operations requiring audit trail
 - Operations needing idempotency
-- Webhook processing
 - Compliance-related operations
-- Operations that might need replay
 
-**⚡ Use Request/Reply for:**
-- Status checks and queries
+**⚡ Use Core NATS Request/Reply for:**
+- Status checks and queries (sync, rsync)
 - Real-time validations
 - Session/token generation
-- Balance checks
-- Tax calculations
 - Operations that don't modify state
 
-### Stream Configuration Recommendations
+---
+
+## Stream Configuration
 
 ```yaml
 HYPERSWITCH_PAYMENTS:
@@ -124,7 +426,7 @@ HYPERSWITCH_PAYMENTS:
   max_age: 30d
   storage: file
   replicas: 3
-  duplicate_window: 5m  # Idempotency via Nats-Msg-Id
+  duplicate_window: 5m  # Nats-Msg-Id deduplication
 
 HYPERSWITCH_REFUNDS:
   subjects:
@@ -135,571 +437,117 @@ HYPERSWITCH_REFUNDS:
   replicas: 3
   duplicate_window: 5m
 
-HYPERSWITCH_WEBHOOKS:
+HYPERSWITCH_PAYMENTS_DLQ:
   subjects:
-    - "hyperswitch.webhooks.>"
+    - "hyperswitch.dlq.payments.>"
   retention: limits
   max_age: 7d
   storage: file
   replicas: 2
-  duplicate_window: 5m
-
-HYPERSWITCH_DISPUTES:
-  subjects:
-    - "hyperswitch.disputes.>"
-  retention: limits
-  max_age: 365d  # Legal requirement
-  storage: file
-  replicas: 3
-  duplicate_window: 5m
 ```
 
 ---
 
-## Option D Implementation Notes
+## Implementation Notes from NatsArchitect Review
 
-### Message Publishing Pattern (Hyperswitch → NATS)
+### Key Findings
 
-```rust
-// Publish with Option D (headers + body)
-let headers = Headers::new()
-    .insert("Nats-Msg-Id", &format!("{}_{}", payment_id, attempt_id))  // Idempotency
-    .insert("X-Merchant-Id", &merchant_id)                             // Observability
-    .insert("X-Payment-Id", &payment_id)                               // Observability
-    .insert("X-Correlation-Id", &correlation_id);                      // Tracing
+1. **✅ Correct Patterns:**
+   - Client cloning (Arc-wrapped, cheap)
+   - Timeout handling with tokio::time::timeout
+   - block_in_place usage for sync-to-async bridge
+   - Protocol compliance (headers + body)
 
-let body = serde_json::to_vec(&PaymentMessage {
-    merchant_id: merchant_id.clone(),  // Authoritative
-    payment_id: payment_id.clone(),
-    router_data: router_data,
-})?;
+2. **❌ Critical Issues:**
+   - Using Core NATS for financial ops (should use JetStream)
+   - Nats-Msg-Id header set but not enforced
+   - No message persistence or replay
+   - No worker acknowledgments
 
-jetstream.publish_with_headers(
-    "hyperswitch.payments.authorize",
-    headers,
-    body
-).await?;
-```
+3. **⚠️ Needs Improvement:**
+   - Connection cache has memory leak risk
+   - Manual reconnection logic (trust auto-reconnect)
+   - Missing observability (metrics, tracing)
+   - No circuit breaker
 
-### Message Consumption Pattern (Worker)
+### Recommended Pattern (from NatsArchitect)
 
 ```rust
-async fn process_message(msg: Message) -> Result<()> {
-    // OPTIONAL: Fast check via headers (observability/logging)
-    let merchant_header = msg.headers.get("X-Merchant-Id");
-
-    // REQUIRED: Parse body (authoritative for processing)
-    let payment: PaymentMessage = serde_json::from_slice(&msg.payload)?;
-
-    // OPTIONAL: Validate consistency (catch serialization bugs)
-    if let Some(header) = merchant_header {
-        if header != &payment.merchant_id {
-            log::warn!(
-                "Header/body mismatch: header={} body={} - using body",
-                header, payment.merchant_id
-            );
-        }
-    }
-
-    // ALWAYS use body for business logic
-    process_payment(&payment.merchant_id, &payment.router_data).await
+// Hybrid JetStream + Request-Reply
+async fn authorize_hybrid(req: &PaymentRequest) -> Result<PaymentResponse> {
+    // 1. Publish to JetStream (persistence + idempotency)
+    let ack = jetstream.publish_with_headers(subject, headers, payload).await?.await?;
+    
+    // 2. Wait for response via inbox (for 3DS synchronous response)
+    let inbox = client.new_inbox();
+    let response = timeout(30s, inbox_sub.next()).await?;
+    
+    // Worker:
+    // - Pulls from JetStream stream
+    // - Processes payment
+    // - Sends response to reply-to inbox
+    // - ACKs message after success
+    
+    Ok(response)
 }
 ```
 
-### Key Implementation Rules
-
-1. **Subject Structure**: No merchant_id in subjects
-   - ✅ `hyperswitch.payments.authorize`
-   - ❌ `hyperswitch.payments.{merchant_id}.authorize`
-
-2. **Headers**: merchant_id + entity IDs for observability
-   - Required: `X-Merchant-Id`, `X-Correlation-Id`, `Nats-Msg-Id`
-   - Operation-specific: `X-Payment-Id`, `X-Refund-Id`, etc.
-
-3. **Body**: Complete RouterData with merchant_id
-   - Body is ALWAYS authoritative
-   - Headers are metadata for NATS layer
-
-4. **Worker Subscriptions**: No wildcards needed
-   - ✅ `hyperswitch.payments.authorize` (all merchants)
-   - ✅ `hyperswitch.payments.>` (all payment operations)
-   - ❌ `hyperswitch.payments.*.authorize` (no need for wildcards)
-
-5. **Validation**: Optional but recommended
-   - Check header/body consistency on message receipt
-   - Log mismatches as warnings (indicates serialization bug)
-   - Always trust body for processing
-
 ---
-
-## Phase 0: Pre-Implementation Requirements
-
-### Environment Setup
-- [ ] Install NATS server locally (v2.10+)
-- [ ] Enable JetStream: `nats-server -js`
-- [ ] Install NATS CLI tools: `brew install nats-io/nats-tools/nats`
-- [ ] Verify JetStream: `nats stream ls`
-
-### Development Tools
-- [ ] Install cargo-watch for auto-reload: `cargo install cargo-watch`
-- [ ] Setup NATS monitoring dashboard
-- [ ] Configure VS Code with Rust analyzer
-- [ ] Install NATS protocol analyzer
-
-### Local NATS Configuration
-- [ ] Create local NATS config file with JetStream enabled
-- [ ] Configure authentication (user/password or JWT)
-- [ ] Set up TLS certificates for development
-- [ ] Configure stream and consumer defaults
-
-## Phase 1: Initial Setup and Scaffold Generation
-
-### 1.1 Generate Connector Base
-- [ ] Run `sh scripts/add_connector.sh nats_bridge nats://localhost:4222`
-- [ ] Verify all files are generated correctly
-- [ ] Check that enums are added in all required places
-- [ ] Ensure routing configurations are updated
-
-### 1.2 Add Dependencies
-- [ ] Add `async-nats = "0.33"` to `crates/hyperswitch_connectors/Cargo.toml`
-- [ ] Add `serde_json = "1.0"` for message serialization
-- [ ] Add `uuid` for correlation ID generation
-- [ ] Add `chrono` for timestamps
-
-### 1.3 Configuration Setup
-- [ ] Add NATS configuration to `config/development.toml`
-- [ ] Add NATS configuration to `config/docker_compose.toml`
-- [ ] Add NATS configuration to `config/config.example.toml`
-- [ ] Add JetStream configuration parameters
-
-## Phase 2: Core Implementation
-
-### 2.1 NATS Client Integration
-- [ ] Create NATS client initialization in `mod.rs`
-- [ ] Implement connection pooling
-- [ ] Add connection health checks
-- [ ] Implement graceful shutdown
-
-### 2.2 Type Definitions
-- [ ] Define `NatsPaymentRequest` structure in `types.rs`
-- [ ] Define `NatsPaymentResponse` structure
-- [ ] Define `PaymentOperation` enum
-- [ ] Create error types for NATS operations
-
-### 2.3 Transform RouterData to NATS Messages
-- [ ] Implement serialization in `transformers.rs`
-- [ ] Handle all payment method types
-- [ ] Preserve all necessary metadata
-- [ ] Add correlation ID generation
-
-## Phase 3: Implement Payment Operations
-
-### 3.1 Payment Authorization
-- [ ] Implement `PaymentAuthorize` trait for NATS
-- [ ] Replace HTTP logic with NATS publish
-- [ ] Add request-reply pattern
-- [ ] Handle timeout scenarios
-
-### 3.2 Payment Capture
-- [ ] Implement `PaymentCapture` trait
-- [ ] Create capture message format
-- [ ] Handle partial captures
-- [ ] Implement idempotency
-
-### 3.3 Payment Void/Cancel
-- [ ] Implement `PaymentVoid` trait
-- [ ] Create cancellation message format
-- [ ] Handle post-capture cancellations
-- [ ] Implement status tracking
-
-### 3.4 Payment Sync
-- [ ] Implement `PaymentSync` trait
-- [ ] Create sync message format
-- [ ] Handle status queries
-- [ ] Implement caching strategy
-
-### 3.5 Refund Operations
-- [ ] Implement `RefundExecute` trait
-- [ ] Implement `RefundSync` trait
-- [ ] Create refund message format
-- [ ] Handle partial refunds
-
-### 3.6 Mandate Setup
-- [ ] Implement `MandateSetup` trait
-- [ ] Create mandate message format
-- [ ] Handle recurring payment setup
-- [ ] Implement mandate storage
-
-### 3.7 Session Management
-- [ ] Implement `PaymentSession` trait
-- [ ] Handle session token generation
-- [ ] Implement session validation
-- [ ] Add session expiry handling
-
-### 3.8 Tokenization
-- [ ] Implement `PaymentToken` trait
-- [ ] Create tokenization message format
-- [ ] Handle token storage
-- [ ] Implement token validation
-
-## Phase 4: JetStream Integration
-
-### 4.1 Stream Configuration
-- [ ] Create PAYMENTS stream
-- [ ] Configure retention policies
-- [ ] Set up deduplication window
-- [ ] Configure replication
-
-### 4.2 Consumer Setup
-- [ ] Create durable consumers for each operation
-- [ ] Configure acknowledgment policies
-- [ ] Set up delivery policies
-- [ ] Implement consumer groups
-
-### 4.3 Message Persistence
-- [ ] Implement message storage
-- [ ] Add message replay capability
-- [ ] Create audit trail
-- [ ] Implement data retention
-
-## Phase 5: Error Handling & Reliability
-
-### 5.1 Error Handling
-- [ ] Implement comprehensive error mapping
-- [ ] Add retry logic with exponential backoff
-- [ ] Create dead letter queue handling
-- [ ] Implement circuit breaker pattern
-
-### 5.2 Timeout Management
-- [ ] Configure operation-specific timeouts
-- [ ] Implement timeout error responses
-- [ ] Add timeout metrics
-- [ ] Create timeout recovery
-
-### 5.3 Idempotency
-- [ ] Implement idempotency keys
-- [ ] Add duplicate detection
-- [ ] Create idempotency storage
-- [ ] Handle replay scenarios
-
-## Phase 6: Worker Service Development
-
-### 6.1 Sample Worker Implementation
-- [ ] Create Python sample worker
-- [ ] Create Go sample worker
-- [ ] Create Node.js sample worker
-- [ ] Document worker interface
-
-### 6.2 Worker Templates
-- [ ] Create worker template for Stripe
-- [ ] Create worker template for Adyen
-- [ ] Create worker template for PayPal
-- [ ] Create generic worker template
-
-### 6.3 Worker Management
-- [ ] Implement worker health checks
-- [ ] Add worker registration
-- [ ] Create worker discovery
-- [ ] Implement load balancing
-
-## Phase 7: Testing
-
-### 7.1 Unit Tests
-- [ ] Write tests for message serialization
-- [ ] Write tests for error handling
-- [ ] Write tests for timeout scenarios
-- [ ] Write tests for retry logic
-
-### 7.2 Integration Tests
-- [ ] Create NATS test container setup
-- [ ] Write end-to-end payment flow tests
-- [ ] Test failover scenarios
-- [ ] Test message replay
-
-### 7.3 Load Testing
-- [ ] Create load test scenarios
-- [ ] Test concurrent operations
-- [ ] Measure throughput limits
-- [ ] Test backpressure handling
-
-### 7.4 Connector Tests
-- [ ] Update `crates/router/tests/connectors/nats_bridge.rs`
-- [ ] Add test credentials to `sample_auth.toml`
-- [ ] Create mock NATS server for tests
-- [ ] Implement test worker
-
-### 7.5 Mock NATS Server for Tests
-- [ ] Use `testcontainers` with NATS image
-- [ ] Create deterministic test subjects
-- [ ] Implement mock worker responses
-- [ ] Add latency injection for timeout tests
-
-### 7.6 Test Scenarios
-- [ ] Happy path: Successful payment authorization
-- [ ] Timeout: Worker doesn't respond in time
-- [ ] Network failure: NATS connection drops
-- [ ] Worker error: Worker returns error response
-- [ ] Duplicate: Same payment sent twice
-- [ ] Replay: Message replay from JetStream
-- [ ] Idempotency: Multiple identical requests
-- [ ] Circuit breaker: Multiple consecutive failures
-
-## Phase 8: Monitoring & Observability
-
-### 8.1 Metrics
-- [ ] Add message processing metrics
-- [ ] Implement latency tracking
-- [ ] Add success/failure rates
-- [ ] Create dashboard templates
-
-### 8.2 Logging
-- [ ] Implement structured logging
-- [ ] Add correlation ID tracking
-- [ ] Create log aggregation
-- [ ] Implement log analysis
-
-### 8.3 Tracing
-- [ ] Implement distributed tracing
-- [ ] Add trace propagation
-- [ ] Create trace visualization
-- [ ] Implement trace analysis
-
-## Phase 9: Documentation
-
-### 9.1 API Documentation
-- [ ] Document NATS message formats
-- [ ] Create worker API specification
-- [ ] Document configuration options
-- [ ] Create troubleshooting guide
-
-### 9.2 Implementation Guide
-- [ ] Write worker development guide
-- [ ] Create deployment guide
-- [ ] Document best practices
-- [ ] Create migration guide
-
-### 9.3 Examples
-- [ ] Create example configurations
-- [ ] Provide worker examples
-- [ ] Create integration examples
-- [ ] Document common patterns
-
-## Phase 10: Security
-
-### 10.1 Transport Security
-- [ ] Implement TLS for NATS connections
-- [ ] Add certificate management
-- [ ] Implement mutual TLS
-- [ ] Create security policies
-
-### 10.2 Message Security
-- [ ] Implement message encryption
-- [ ] Add message signing
-- [ ] Create key management
-- [ ] Implement access control
-
-### 10.3 Audit & Compliance
-- [ ] Implement audit logging
-- [ ] Add compliance checks
-- [ ] Create audit reports
-- [ ] Implement data retention
-
-## Phase 11: Production Readiness
-
-### 11.1 Performance Optimization
-- [ ] Optimize message serialization
-- [ ] Implement connection pooling
-- [ ] Add caching layer
-- [ ] Optimize memory usage
-
-### 11.2 High Availability
-- [ ] Implement failover mechanisms
-- [ ] Add health check endpoints
-- [ ] Create disaster recovery plan
-- [ ] Implement backup strategies
-
-### 11.3 Deployment
-- [ ] Create Docker image
-- [ ] Write Kubernetes manifests
-- [ ] Create Helm charts
-- [ ] Document deployment process
-
-## Phase 12: Advanced Features
-
-### 12.1 Dynamic Routing
-- [ ] Implement routing rules engine
-- [ ] Add A/B testing capability
-- [ ] Create fallback mechanisms
-- [ ] Implement load distribution
-
-### 12.2 Multi-Region Support
-- [ ] Implement geo-routing
-- [ ] Add regional failover
-- [ ] Create data replication
-- [ ] Implement latency optimization
-
-### 12.3 Rate Limiting
-- [ ] Implement rate limiting
-- [ ] Add quota management
-- [ ] Create throttling mechanisms
-- [ ] Implement backpressure
-
-## Performance Targets
-
-### Latency Requirements
-- Authorization: < 2 seconds p99
-- Capture: < 1 second p99
-- Sync: < 500ms p99
-- Refund: < 3 seconds p99
-- Session creation: < 1 second p99
-
-### Throughput Targets
-- 1000 requests/second per instance
-- 10,000 concurrent operations
-- 100,000 messages in JetStream
-- 50 workers per operation type
-
-### Resource Usage
-- Memory: < 500MB per Hyperswitch instance
-- CPU: < 2 cores at peak load
-- Network: < 100Mbps bandwidth
-- Connections: < 100 NATS connections
-
-## Migration from Direct Connectors
-
-### Phase 1: Shadow Mode
-- [ ] Run NATS bridge in parallel with direct connectors
-- [ ] Compare responses for accuracy
-- [ ] Measure performance differences
-- [ ] Log discrepancies for analysis
-
-### Phase 2: Canary Deployment
-- [ ] Route 1% traffic to NATS bridge
-- [ ] Monitor error rates and latency
-- [ ] Gradually increase to 10%, 50%, 100%
-- [ ] Maintain rollback capability
-
-### Phase 3: Full Migration
-- [ ] Switch all traffic to NATS bridge
-- [ ] Deprecate direct connector code
-- [ ] Document lessons learned
-- [ ] Update monitoring dashboards
-
-## Debugging Guide
-
-### Common Issues and Solutions
-
-1. **Connection refused**
-   - Check: NATS server is running (`ps aux | grep nats-server`)
-   - Solution: Start NATS with `nats-server -js`
-
-2. **Timeout errors**
-   - Check: Worker health (`nats consumer info PAYMENTS`)
-   - Solution: Increase timeout or scale workers
-
-3. **Subject not found**
-   - Check: Worker subscriptions (`nats sub "hyperswitch.>" --count 1`)
-   - Solution: Verify worker is subscribed to correct subject
-
-4. **Duplicate messages**
-   - Check: JetStream dedup window (`nats stream info PAYMENTS`)
-   - Solution: Increase dedup window or add idempotency key
-
-5. **Authentication failures**
-   - Check: NATS credentials in config
-   - Solution: Update credentials or disable auth for dev
-
-### Debug Commands
-```bash
-# Monitor all payment messages
-nats sub "hyperswitch.payments.>" --headers
-
-# Check stream status
-nats stream info HYPERSWITCH_PAYMENTS
-
-# View consumer status
-nats consumer info HYPERSWITCH_PAYMENTS payment-processor
-
-# Publish test message with Option D format
-nats pub hyperswitch.payments.authorize \
-  --header "X-Merchant-Id:merchant_123" \
-  --header "X-Payment-Id:pay_test" \
-  '{"merchant_id":"merchant_123","payment_id":"pay_test","router_data":{}}'
-
-# Check message in stream
-nats stream get HYPERSWITCH_PAYMENTS 1
-
-# Monitor specific merchant via headers (requires filtering in consumer)
-nats sub "hyperswitch.payments.>" --headers | grep "X-Merchant-Id:merchant_123"
-
-# Check worker subscriptions
-nats server report connections
-
-# View stream statistics
-nats stream report
-
-# Verify Option D consistency (headers match body)
-nats sub "hyperswitch.payments.>" --headers | \
-  jq -r 'select(.headers["X-Merchant-Id"] != .merchant_id)'
-```
-
-### Troubleshooting Checklist
-- [ ] NATS server running and accessible
-- [ ] JetStream enabled and configured
-- [ ] Workers subscribed to correct subjects
-- [ ] Network connectivity between services
-- [ ] Proper authentication credentials
-- [ ] Sufficient resources (memory/CPU)
-- [ ] Correct message format
-- [ ] Timeout values appropriate
-- [ ] Error handling implemented
-- [ ] Monitoring dashboards working
 
 ## Validation Checklist
 
-Before marking the connector as production-ready:
+### Phase 1 Completion Criteria
+- [ ] JetStream stream HYPERSWITCH_PAYMENTS created
+- [ ] authorize() using hybrid pattern
+- [ ] capture() using hybrid pattern
+- [ ] refund execute() using hybrid pattern
+- [ ] Timeout recovery job running
+- [ ] CompleteAuthorize (3DS) implemented
+- [ ] Basic metrics emitting
+- [ ] Worker examples documented
+- [ ] Integration tests passing
 
-- [ ] All payment operations work end-to-end
-- [ ] Error handling is comprehensive
-- [ ] Timeouts are properly configured
-- [ ] Retries work as expected
-- [ ] JetStream persistence is verified
-- [ ] Workers can process all message types
-- [ ] Security measures are in place
-- [ ] Monitoring is operational
-- [ ] Documentation is complete
-- [ ] Load testing passes requirements
-- [ ] Integration tests are green
-- [ ] Code review is complete
-- [ ] Performance benchmarks are met
-- [ ] Deployment automation works
-- [ ] Rollback procedures are tested
+### Phase 2 Completion Criteria  
+- [ ] Connection management simplified
+- [ ] Circuit breaker implemented
+- [ ] Void operation working
+- [ ] Load test passing (1000 req/s)
+- [ ] p99 latency < 2s for authorize
 
-## Notes
+### Production Readiness Criteria
+- [ ] All Phase 1 items complete
+- [ ] All Phase 2 items complete
+- [ ] Zero stuck payments in 24h test
+- [ ] Zero duplicate charges in load test
+- [ ] Monitoring dashboards operational
+- [ ] Runbook documented
+- [ ] Security review passed
 
-- Start with Phase 1-3 for MVP
-- Phases 4-6 for production readiness
-- Phases 7-9 for quality assurance
-- Phases 10-12 for enterprise features
+---
 
-## Dependencies
+## Timeline
 
-- Requires NATS server 2.10+ with JetStream enabled
-- Workers can be developed in parallel
-- Configuration changes need coordination with DevOps
-- Security review needed before production deployment
+- **Phase 1 (Critical):** 5-7 days ← **START HERE**
+- **Phase 2 (Hardening):** 3-5 days
+- **Phase 3 (Advanced):** 5-7 days (optional)
 
-## Timeline Estimate
-
-- Phase 1-3: 1 week (MVP - Core payments + refunds)
-- Phase 4-6: 2 weeks (Production - JetStream + workers)
-- Phase 7-9: 1 week (Quality - Testing + monitoring)
-- Phase 10-12: 2 weeks (Enterprise - Security + advanced features)
-
-Total estimated time: 6 weeks for full implementation
+**Total to production:** 2-3 weeks
 
 ---
 
 ## Related Documentation
 
 - **[NATS.md](./NATS.md)** - Complete protocol guide with worker examples
+- **[NATS Architecture Review](./docs/nats-architecture-review.md)** - Full architect assessment
+- **[natsbyexample.com](https://natsbyexample.com)** - NATS patterns and examples
+- **[docs.nats.io](https://docs.nats.io)** - Official NATS documentation
+
+---
+
+## Notes
+
+- **Current implementation compiles and runs** but uses wrong pattern for financial ops
+- **Not a rewrite** - infrastructure is solid, just needs pattern upgrade
+- **Architects confirmed** core patterns (async safety, client cloning, timeouts) are correct
+- **Main blocker** - Must use JetStream for persistence and idempotency
+- **Estimated effort** - 2-3 weeks to full production readiness

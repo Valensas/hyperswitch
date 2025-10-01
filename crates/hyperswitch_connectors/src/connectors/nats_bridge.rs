@@ -14,12 +14,12 @@ use error_stack::{report, ResultExt};
 use hyperswitch_domain_models::{
     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
     router_flow_types::{
-        payments::{Authorize, Capture, PSync, PaymentMethodToken, Session, SetupMandate, Void},
+        payments::{Authorize, Capture, CompleteAuthorize, PSync, PaymentMethodToken, Session, SetupMandate, Void},
         refunds::{Execute, RSync},
         AccessTokenAuth,
     },
     router_request_types::{
-        AccessTokenRequestData, PaymentMethodTokenizationData, PaymentsAuthorizeData,
+        AccessTokenRequestData, CompleteAuthorizeData, PaymentMethodTokenizationData, PaymentsAuthorizeData,
         PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData, PaymentsSyncData,
         RefundsData, SetupMandateRequestData,
     },
@@ -27,8 +27,8 @@ use hyperswitch_domain_models::{
         ConnectorInfo, PaymentsResponseData, RefundsResponseData, SupportedPaymentMethods,
     },
     types::{
-        PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsSyncRouterData,
-        RefundSyncRouterData, RefundsRouterData,
+        PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData,
+        PaymentsSyncRouterData, RefundSyncRouterData, RefundsRouterData,
     },
 };
 use hyperswitch_interfaces::{
@@ -64,6 +64,7 @@ static NATS_RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 
 // NATS Subjects per NATS.md protocol
 const SUBJECT_PAYMENTS_AUTHORIZE: &str = "hyperswitch.payments.authorize";
+const SUBJECT_PAYMENTS_COMPLETE_AUTHORIZE: &str = "hyperswitch.payments.complete_authorize";
 const SUBJECT_PAYMENTS_CAPTURE: &str = "hyperswitch.payments.capture";
 #[allow(dead_code)] // Will be used when Void operation is implemented
 const SUBJECT_PAYMENTS_VOID: &str = "hyperswitch.payments.void";
@@ -116,6 +117,7 @@ impl api::PaymentAuthorize for NatsBridge {}
 impl api::PaymentSync for NatsBridge {}
 impl api::PaymentCapture for NatsBridge {}
 impl api::PaymentVoid for NatsBridge {}
+impl api::PaymentsCompleteAuthorize for NatsBridge {}
 impl api::Refund for NatsBridge {}
 impl api::RefundExecute for NatsBridge {}
 impl api::RefundSync for NatsBridge {}
@@ -239,15 +241,17 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         let connector_req =
             nats_bridge::NatsBridgePaymentsRequest::try_from(&connector_router_data)?;
 
-        // Use request-reply pattern with block_in_place to prevent deadlocks
-        // block_in_place tells tokio to spawn a new thread, preventing blocking the async runtime
+        // Use hybrid JetStream + request-reply pattern for financial operations
+        // JetStream provides persistence and idempotency, inbox provides synchronous response for 3DS
         let response_payload = tokio::task::block_in_place(|| {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
                 let client = cache.get_client(nats_url).await?;
+                let jetstream = cache.get_jetstream(&client).await?;
 
                 cache
-                    .request_reply(
+                    .publish_with_response(
+                        &jetstream,
                         &client,
                         SUBJECT_PAYMENTS_AUTHORIZE,
                         headers,
@@ -261,7 +265,7 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         router_env::logger::info!(
             payment_id = ?req.payment_id,
             attempt_id = ?req.attempt_id,
-            "Received authorize response from worker"
+            "Received authorize response from worker (via JetStream + inbox)"
         );
 
         // Return response as HTTP request body for handle_response to parse
@@ -283,6 +287,98 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         let response: nats_bridge::NatsBridgePaymentsResponse = res
             .response
             .parse_struct("NatsBridge PaymentsAuthorizeResponse")
+            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
+        event_builder.map(|i| i.set_response_body(&response));
+        router_env::logger::info!(connector_response=?response);
+
+        RouterData::try_from(crate::types::ResponseRouterData {
+            response,
+            data: data.clone(),
+            http_code: res.status_code,
+        })
+    }
+
+    fn get_error_response(
+        &self,
+        res: Response,
+        event_builder: Option<&mut ConnectorEvent>,
+    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
+        self.build_error_response(res, event_builder)
+    }
+}
+
+// ============================================================================
+// COMPLETE AUTHORIZE - JetStream + Inbox Pattern (3DS/2FA Completion)
+// ============================================================================
+impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResponseData>
+    for NatsBridge
+{
+    fn build_request(
+        &self,
+        req: &PaymentsCompleteAuthorizeRouterData,
+        connectors: &Connectors,
+    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
+        let nats_url = self.base_url(connectors);
+        let headers = self.build_nats_headers(req);
+
+        // CompleteAuthorizeData has i64 amount, convert to MinorUnit first
+        let minor_unit_amount = common_utils::types::MinorUnit::new(req.request.amount);
+        let amount = utils::convert_amount(
+            self.amount_converter,
+            minor_unit_amount,
+            req.request.currency,
+        )?;
+
+        let connector_router_data = nats_bridge::NatsBridgeRouterData::from((amount, req));
+        let connector_req =
+            nats_bridge::NatsBridgeCompleteAuthorizeRequest::try_from(&connector_router_data)?;
+
+        // Use hybrid JetStream + request-reply pattern (3DS needs synchronous response)
+        let response_payload = tokio::task::block_in_place(|| {
+            NATS_RUNTIME.block_on(async {
+                let cache = NatsClientCache::global();
+                let client = cache.get_client(nats_url).await?;
+                let jetstream = cache.get_jetstream(&client).await?;
+
+                cache
+                    .publish_with_response(
+                        &jetstream,
+                        &client,
+                        SUBJECT_PAYMENTS_COMPLETE_AUTHORIZE,
+                        headers,
+                        &connector_req,
+                        TIMEOUT_AUTHORIZE,
+                    )
+                    .await
+            })
+        })?;
+
+        router_env::logger::info!(
+            payment_id = ?req.payment_id,
+            attempt_id = ?req.attempt_id,
+            "Received complete_authorize response from worker (via JetStream + inbox)"
+        );
+
+        Ok(Some(
+            common_utils::request::RequestBuilder::new()
+                .method(common_utils::request::Method::Post)
+                .url(&format!("nats://{}", SUBJECT_PAYMENTS_COMPLETE_AUTHORIZE))
+                .set_body(common_utils::request::RequestContent::RawBytes(
+                    response_payload.to_vec(),
+                ))
+                .build(),
+        ))
+    }
+
+    fn handle_response(
+        &self,
+        data: &PaymentsCompleteAuthorizeRouterData,
+        event_builder: Option<&mut ConnectorEvent>,
+        res: Response,
+    ) -> CustomResult<PaymentsCompleteAuthorizeRouterData, errors::ConnectorError> {
+        let response: nats_bridge::NatsBridgePaymentsResponse = res
+            .response
+            .parse_struct("NatsBridge CompleteAuthorizeResponse")
             .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
         event_builder.map(|i| i.set_response_body(&response));
         router_env::logger::info!(connector_response=?response);
@@ -399,14 +495,16 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         let connector_req =
             nats_bridge::NatsBridgeCaptureRequest::try_from(&connector_router_data)?;
 
-        // Use request-reply pattern
+        // Use hybrid JetStream + request-reply pattern for financial operations
         let response_payload = tokio::task::block_in_place(|| {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
                 let client = cache.get_client(nats_url).await?;
+                let jetstream = cache.get_jetstream(&client).await?;
 
                 cache
-                    .request_reply(
+                    .publish_with_response(
+                        &jetstream,
                         &client,
                         SUBJECT_PAYMENTS_CAPTURE,
                         headers,
@@ -420,7 +518,7 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         router_env::logger::info!(
             payment_id = ?req.payment_id,
             attempt_id = ?req.attempt_id,
-            "Received capture response from worker"
+            "Received capture response from worker (via JetStream + inbox)"
         );
 
         Ok(Some(
@@ -486,14 +584,16 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for NatsBri
         let connector_router_data = nats_bridge::NatsBridgeRouterData::from((refund_amount, req));
         let connector_req = nats_bridge::NatsBridgeRefundRequest::try_from(&connector_router_data)?;
 
-        // Use request-reply pattern
+        // Use hybrid JetStream + request-reply pattern for financial operations
         let response_payload = tokio::task::block_in_place(|| {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
                 let client = cache.get_client(nats_url).await?;
+                let jetstream = cache.get_jetstream(&client).await?;
 
                 cache
-                    .request_reply(
+                    .publish_with_response(
+                        &jetstream,
                         &client,
                         SUBJECT_REFUNDS_EXECUTE,
                         headers,
@@ -507,7 +607,7 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for NatsBri
         router_env::logger::info!(
             refund_id = ?req.request.refund_id,
             payment_id = ?req.payment_id,
-            "Received refund execute response from worker"
+            "Received refund execute response from worker (via JetStream + inbox)"
         );
 
         Ok(Some(
