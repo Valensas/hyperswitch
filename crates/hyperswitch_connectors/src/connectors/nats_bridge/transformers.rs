@@ -11,7 +11,7 @@ use hyperswitch_domain_models::{
     types::{PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData, PaymentsSyncRouterData, RefundsRouterData},
 };
 use hyperswitch_interfaces::errors;
-use masking::{ExposeInterface, Secret};
+use masking::{ExposeInterface, PeekInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{RefundsResponseRouterData, ResponseRouterData};
@@ -60,14 +60,25 @@ pub struct NatsMessageEnvelope<T> {
     pub router_data: T,
 }
 
+/// Card details for NATS workers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatsBridgeCard {
+    pub card_number: String,
+    pub card_exp_month: String,
+    pub card_exp_year: String,
+    pub card_cvc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_holder_name: Option<String>,
+}
+
 /// Payment Request for NATS workers - Authorize
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsBridgePaymentsRequest {
-    pub amount: String,
+    pub amount: i64,
     pub currency: enums::Currency,
     pub payment_method: enums::PaymentMethod,
-    pub payment_method_type: Option<enums::PaymentMethodType>,
-    pub payment_method_data: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<NatsBridgeCard>,
     pub return_url: Option<String>,
     pub webhook_url: Option<String>,
     pub browser_info: Option<serde_json::Value>,
@@ -84,15 +95,28 @@ impl TryFrom<&NatsBridgeRouterData<&PaymentsAuthorizeRouterData>> for NatsBridge
         let router_data = item.router_data;
         let request = &router_data.request;
 
+        // Extract card details if payment method is card
+        let card = match &request.payment_method_data {
+            hyperswitch_domain_models::payment_method_data::PaymentMethodData::Card(card_data) => {
+                Some(NatsBridgeCard {
+                    card_number: card_data.card_number.peek().to_string(),
+                    card_exp_month: card_data.card_exp_month.clone().expose(),
+                    card_exp_year: card_data.card_exp_year.clone().expose(),
+                    card_cvc: card_data.card_cvc.clone().expose(),
+                    card_holder_name: card_data.card_holder_name.as_ref().map(|n| n.clone().expose()),
+                })
+            },
+            _ => None,
+        };
+
         Ok(Self {
-            amount: item.amount.to_string(),
+            amount: item.amount.to_string().parse::<i64>()
+                .change_context(errors::ConnectorError::ParsingFailed)?,
             currency: request.currency,
             payment_method: request.payment_method_data.get_payment_method().ok_or(
                 errors::ConnectorError::MissingRequiredField { field_name: "payment_method" }
             )?,
-            payment_method_type: request.payment_method_type,
-            payment_method_data: serde_json::to_value(&request.payment_method_data)
-                .change_context(errors::ConnectorError::RequestEncodingFailed)?,
+            card,
             return_url: request.router_return_url.clone(),
             webhook_url: request.webhook_url.clone(),
             browser_info: request.browser_info.as_ref().map(|info| {

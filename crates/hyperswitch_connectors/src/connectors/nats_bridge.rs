@@ -24,7 +24,8 @@ use hyperswitch_domain_models::{
         RefundsData, SetupMandateRequestData,
     },
     router_response_types::{
-        ConnectorInfo, PaymentsResponseData, RefundsResponseData, SupportedPaymentMethods,
+        ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
+        SupportedPaymentMethods, SupportedPaymentMethodsExt,
     },
     types::{
         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData, PaymentsCompleteAuthorizeRouterData,
@@ -47,9 +48,8 @@ use transformers as nats_bridge;
 use crate::utils;
 use client_pool::NatsClientCache;
 
-// Global Tokio runtime for blocking async NATS operations
-// This is necessary because Hyperswitch connectors are called from async context
-// but the build_request/handle_response methods are synchronous
+// Global Tokio runtime for NATS operations
+// Separate runtime needed because build_request is sync but NATS client is async
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
@@ -70,12 +70,6 @@ const SUBJECT_PAYMENTS_VOID: &str = "hyperswitch.payments.void";
 const SUBJECT_PAYMENTS_SYNC: &str = "hyperswitch.payments.sync";
 const SUBJECT_REFUNDS_EXECUTE: &str = "hyperswitch.refunds.execute";
 const SUBJECT_REFUNDS_SYNC: &str = "hyperswitch.refunds.sync";
-
-// Operation timeouts (request-reply pattern)
-const TIMEOUT_AUTHORIZE: std::time::Duration = std::time::Duration::from_secs(30);
-const TIMEOUT_CAPTURE: std::time::Duration = std::time::Duration::from_secs(30);
-const TIMEOUT_REFUND: std::time::Duration = std::time::Duration::from_secs(30);
-const TIMEOUT_SYNC: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct NatsBridge {
@@ -240,26 +234,45 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
         let connector_req =
             nats_bridge::NatsBridgePaymentsRequest::try_from(&connector_router_data)?;
 
-        // Use hybrid JetStream + request-reply pattern for financial operations
-        // JetStream provides persistence and idempotency, inbox provides synchronous response for 3DS
-        let response_payload = tokio::task::block_in_place(|| {
+        // Wrap in envelope with merchant_id per NATS protocol
+        let envelope = nats_bridge::NatsMessageEnvelope {
+            merchant_id: req.merchant_id.get_string_repr().to_string(),
+            payment_id: Some(req.payment_id.clone()),
+            attempt_id: Some(req.attempt_id.clone()),
+            correlation_id: req.connector_request_reference_id.clone(),
+            router_data: connector_req.clone(),
+        };
+
+        // Use standard NATS request-reply pattern
+        // Spawn blocking thread to avoid nested runtime issue
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
-                let jetstream = cache.get_jetstream(&client).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .publish_with_response(
-                        &jetstream,
-                        &client,
-                        SUBJECT_PAYMENTS_AUTHORIZE,
-                        headers,
-                        &connector_req,
-                        TIMEOUT_AUTHORIZE,
+                // Serialize payload
+                let payload_bytes = serde_json::to_vec(&envelope)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                // Use NATS request-reply (automatically creates inbox and sets msg.reply)
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_PAYMENTS_AUTHORIZE.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             payment_id = ?req.payment_id,
@@ -267,14 +280,10 @@ impl ConnectorIntegration<Authorize, PaymentsAuthorizeData, PaymentsResponseData
             "Received authorize response from worker (via JetStream + inbox)"
         );
 
-        // Return response as HTTP request body for handle_response to parse
-        Ok(Some(
-            common_utils::request::RequestBuilder::new()
-                .method(common_utils::request::Method::Post)
-                .url(&format!("nats://{}", SUBJECT_PAYMENTS_AUTHORIZE))
-                .set_body(common_utils::request::RequestContent::RawBytes(response_payload.to_vec()))
-                .build(),
-        ))
+        // We've already executed the NATS request and have the response
+        // Return None to indicate no HTTP call should be made
+        // Instead, we'll need to handle this in a custom way
+        Ok(None)
     }
 
     fn handle_response(
@@ -332,25 +341,33 @@ impl ConnectorIntegration<CompleteAuthorize, CompleteAuthorizeData, PaymentsResp
         let connector_req =
             nats_bridge::NatsBridgeCompleteAuthorizeRequest::try_from(&connector_router_data)?;
 
-        // Use hybrid JetStream + request-reply pattern (3DS needs synchronous response)
-        let response_payload = tokio::task::block_in_place(|| {
+        // Use standard NATS request-reply pattern
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
-                let jetstream = cache.get_jetstream(&client).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .publish_with_response(
-                        &jetstream,
-                        &client,
-                        SUBJECT_PAYMENTS_COMPLETE_AUTHORIZE,
-                        headers,
-                        &connector_req,
-                        TIMEOUT_AUTHORIZE,
+                let payload_bytes = serde_json::to_vec(&connector_req)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_PAYMENTS_COMPLETE_AUTHORIZE.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             payment_id = ?req.payment_id,
@@ -411,23 +428,33 @@ impl ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponseData> for Nat
         let headers = self.build_nats_headers(req);
         let connector_req = nats_bridge::NatsBridgeSyncRequest::try_from(req)?;
 
-        // Use request-reply to query worker for payment status
-        let response_payload = tokio::task::block_in_place(|| {
+        // Use standard NATS request-reply pattern
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .request_reply(
-                        &client,
-                        SUBJECT_PAYMENTS_SYNC,
-                        headers,
-                        &connector_req,
-                        TIMEOUT_SYNC,
+                let payload_bytes = serde_json::to_vec(&connector_req)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_PAYMENTS_SYNC.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             payment_id = ?req.payment_id,
@@ -494,25 +521,33 @@ impl ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData> fo
         let connector_req =
             nats_bridge::NatsBridgeCaptureRequest::try_from(&connector_router_data)?;
 
-        // Use hybrid JetStream + request-reply pattern for financial operations
-        let response_payload = tokio::task::block_in_place(|| {
+        // Use standard NATS request-reply pattern
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
-                let jetstream = cache.get_jetstream(&client).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .publish_with_response(
-                        &jetstream,
-                        &client,
-                        SUBJECT_PAYMENTS_CAPTURE,
-                        headers,
-                        &connector_req,
-                        TIMEOUT_CAPTURE,
+                let payload_bytes = serde_json::to_vec(&connector_req)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_PAYMENTS_CAPTURE.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             payment_id = ?req.payment_id,
@@ -589,25 +624,33 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Na
         let connector_router_data = nats_bridge::NatsBridgeRouterData::from((amount, req));
         let connector_req = nats_bridge::NatsBridgeVoidRequest::try_from(&connector_router_data)?;
 
-        // Use hybrid JetStream + request-reply pattern (financial operation needs persistence)
-        let response_payload = tokio::task::block_in_place(|| {
+        // Use standard NATS request-reply pattern
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
-                let jetstream = cache.get_jetstream(&client).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .publish_with_response(
-                        &jetstream,
-                        &client,
-                        SUBJECT_PAYMENTS_VOID,
-                        headers,
-                        &connector_req,
-                        TIMEOUT_AUTHORIZE,
+                let payload_bytes = serde_json::to_vec(&connector_req)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_PAYMENTS_VOID.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             payment_id = ?req.payment_id,
@@ -676,25 +719,33 @@ impl ConnectorIntegration<Execute, RefundsData, RefundsResponseData> for NatsBri
         let connector_router_data = nats_bridge::NatsBridgeRouterData::from((refund_amount, req));
         let connector_req = nats_bridge::NatsBridgeRefundRequest::try_from(&connector_router_data)?;
 
-        // Use hybrid JetStream + request-reply pattern for financial operations
-        let response_payload = tokio::task::block_in_place(|| {
+        // Use standard NATS request-reply pattern
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
-                let jetstream = cache.get_jetstream(&client).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .publish_with_response(
-                        &jetstream,
-                        &client,
-                        SUBJECT_REFUNDS_EXECUTE,
-                        headers,
-                        &connector_req,
-                        TIMEOUT_REFUND,
+                let payload_bytes = serde_json::to_vec(&connector_req)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_REFUNDS_EXECUTE.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             refund_id = ?req.request.refund_id,
@@ -757,23 +808,33 @@ impl ConnectorIntegration<RSync, RefundsData, RefundsResponseData> for NatsBridg
             "connector_refund_id": req.request.get_connector_refund_id()?,
         });
 
-        // Use request-reply to query worker for refund status
-        let response_payload = tokio::task::block_in_place(|| {
+        // Use standard NATS request-reply pattern
+        let nats_url_clone = nats_url.to_string();
+        let headers_clone = headers.clone();
+
+        let response_payload: bytes::Bytes = std::thread::spawn(move || -> Result<bytes::Bytes, error_stack::Report<errors::ConnectorError>> {
             NATS_RUNTIME.block_on(async {
                 let cache = NatsClientCache::global();
-                let client = cache.get_client(nats_url).await?;
+                let client = cache.get_client(&nats_url_clone).await?;
 
-                cache
-                    .request_reply(
-                        &client,
-                        SUBJECT_REFUNDS_SYNC,
-                        headers,
-                        &sync_request,
-                        TIMEOUT_SYNC,
+                let payload_bytes = serde_json::to_vec(&sync_request)
+                    .change_context(errors::ConnectorError::RequestEncodingFailed)?;
+
+                let response = client
+                    .request_with_headers(
+                        SUBJECT_REFUNDS_SYNC.to_string(),
+                        headers_clone,
+                        payload_bytes.into(),
                     )
                     .await
+                    .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
+
+                Ok(response.payload)
             })
-        })?;
+        })
+        .join()
+        .map_err(|_| errors::ConnectorError::ProcessingStepFailed(None))?
+        .change_context(errors::ConnectorError::ProcessingStepFailed(None))?;
 
         router_env::logger::info!(
             refund_id = ?req.request.refund_id,
@@ -849,7 +910,62 @@ impl ConnectorIntegration<AccessTokenAuth, AccessTokenRequestData, AccessToken> 
 use std::sync::LazyLock;
 
 static NATS_BRIDGE_SUPPORTED_PAYMENT_METHODS: LazyLock<SupportedPaymentMethods> =
-    LazyLock::new(SupportedPaymentMethods::new);
+    LazyLock::new(|| {
+        use common_enums::{CaptureMethod, FeatureStatus, PaymentMethod};
+        use api_models::feature_matrix::{CardSpecificFeatures, PaymentMethodSpecificFeatures};
+
+        let default_capture_methods = vec![
+            CaptureMethod::Automatic,
+            CaptureMethod::Manual,
+        ];
+
+        let supported_card_networks = vec![
+            common_enums::CardNetwork::Visa,
+            common_enums::CardNetwork::Mastercard,
+            common_enums::CardNetwork::AmericanExpress,
+            common_enums::CardNetwork::Discover,
+        ];
+
+        let mut supported = SupportedPaymentMethods::new();
+
+        // Credit cards
+        supported.add(
+            PaymentMethod::Card,
+            enums::PaymentMethodType::Credit,
+            PaymentMethodDetails {
+                mandates: FeatureStatus::NotSupported,
+                refunds: FeatureStatus::Supported,
+                supported_capture_methods: default_capture_methods.clone(),
+                specific_features: Some(PaymentMethodSpecificFeatures::Card(
+                    CardSpecificFeatures {
+                        three_ds: FeatureStatus::Supported,
+                        no_three_ds: FeatureStatus::Supported,
+                        supported_card_networks: supported_card_networks.clone(),
+                    },
+                )),
+            },
+        );
+
+        // Debit cards
+        supported.add(
+            PaymentMethod::Card,
+            enums::PaymentMethodType::Debit,
+            PaymentMethodDetails {
+                mandates: FeatureStatus::NotSupported,
+                refunds: FeatureStatus::Supported,
+                supported_capture_methods: default_capture_methods,
+                specific_features: Some(PaymentMethodSpecificFeatures::Card(
+                    CardSpecificFeatures {
+                        three_ds: FeatureStatus::Supported,
+                        no_three_ds: FeatureStatus::Supported,
+                        supported_card_networks,
+                    },
+                )),
+            },
+        );
+
+        supported
+    });
 
 static NATS_BRIDGE_CONNECTOR_INFO: ConnectorInfo = ConnectorInfo {
     display_name: "NATS Bridge",
